@@ -557,6 +557,27 @@ public class NativeMethods {
     }
 
     # -------------------------------------------------------------------------------------------------------------
+    # Update the registy value for Maximum Shadow Copy count  : November 17, 2025  - Archana Patil
+    # -------------------------------------------------------------------------------------------------------------
+
+    # Define the registry path and key details
+    $regPath = "HKLM:\System\CurrentControlSet\Services\VSS\Settings"
+    $keyName = "MaxShadowCopies"
+    $keyValue = 512
+
+    # Create the registry path if it doesn't exist
+    if (-not (Test-Path $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
+
+    # Create or update the DWORD value
+    New-ItemProperty -Path $regPath -Name $keyName -Value $keyValue -PropertyType DWord -Force | Out-Null
+
+    # Verify the change
+    Write-Output "Registry key updated successfully:"
+    Get-ItemProperty -Path $regPath | Select-Object $keyName		
+
+    # -------------------------------------------------------------------------------------------------------------
     # Create record in CAEVES Metrics & Billing Table  : June 12, 2025  - Jaap van Duijvenbode
     # Updated Metering API call : September 7, 2025 - Archana Patil
     # -------------------------------------------------------------------------------------------------------------
@@ -811,5 +832,6 @@ catch {
 finally {
     Stop-Transcript
 }
+
 
 exit 0
