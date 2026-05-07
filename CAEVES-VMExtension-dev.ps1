@@ -1,778 +1,471 @@
-# -----------------------------------------------------------------------------------------------------
-# CAEVES-VMExtension.ps1
-# -----------------------------------------------------------------------------------------------------
+#Requires -RunAsAdministrator
+#Requires -Modules Az.Storage
+# ============================================================================================================================
+# CAEVES-VMExtension-dev.ps1
 # CAEVES Configuration Script for Azure Deployment
-# This script should be hosted in your storage account and called by CustomScriptExtension
-# 0.9.6 - June 6, 2025 - Jaap van Duijvenbode
-# -----------------------------------------------------------------------------------------------------
+# This script is hosted in a storage account and invoked by the Azure CustomScriptExtension.
+#
+# Version History:
+#   0.9.6  - June 6, 2025       - Jaap van Duijvenbode  - Initial release
+#   0.9.7  - October 17, 2025   - Archana Patil          - Adjusted Data Disk Initialization for new partitioning scheme
+#   2.0.2  - December 8, 2025   - Archana Patil          - Updated to use Caeves module cmdlets
+#   2.0.3  - April 6, 2026     - Archana Patil          - Refactored into proper function-based architecture;
+#                                                           Added WS2025 NVMe disk identification support
+#   2.0.4  - April 8, 2026     - Archana Patil          - Structured logging via Write-Log [YYYY-MM-DD HH:mm:ss] [LEVEL]
+# ============================================================================================================================
 
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$vmName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ResourceGroupName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$subscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$StorageAccountName,
-    
-    [Parameter(Mandatory = $true)]
-    [string]$StorageAccountKey,
-
-    [Parameter(Mandatory = $true)]
-    [string]$StorageAccountResourceId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ContainerName,
-    
-    [Parameter(Mandatory = $true)]
-    [string]$SnapshotsContainerName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$TableName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ProcessTableName,
-
-    [Parameter(Mandatory = $true)]
-    [string]$CaevesConfigTableName,    
-
-    [Parameter(Mandatory = $true)]
-    [string]$SaasOfferId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$SaasSubscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$AzureSubscriptionId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$PurchaserId,
-    [string]$EnableDomainJoin,
-    [string]$AdFQDN,
-    [string]$OrganizationalUnit,
-    [int]$VssHourlyRetention,
-    [int]$VssDailyRetention,
-    [int]$VssMonthlyRetention,
-    [int]$VssYearlyRetention,
-    [int]$MetaSnapFrequency,
-    [string]$MetaSnapDailyTime,
-    [string]$MetaSnapWeeklyDay,
-    [string]$MetaSnapWeeklyTime,
-    [string]$MetaSnapMonthlyWeekday,
-    [string]$MetaSnapMonthlyTime
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)] [string] $vmName,
+    [Parameter(Mandatory)] [string] $ResourceGroupName,
+    [Parameter(Mandatory)] [string] $subscriptionId,
+    [Parameter(Mandatory)] [string] $StorageAccountName,
+    [Parameter(Mandatory)] [string] $StorageAccountKey,
+    [Parameter(Mandatory)] [string] $StorageAccountResourceId,
+    [Parameter(Mandatory)] [string] $ContainerName,
+    [Parameter(Mandatory)] [string] $SnapshotsContainerName,
+    [Parameter(Mandatory)] [string] $TableName,
+    [Parameter(Mandatory)] [string] $ProcessTableName,
+    [Parameter(Mandatory)] [string] $CaevesConfigTableName,
+    [Parameter(Mandatory)] [string] $SaasOfferId,
+    [Parameter(Mandatory)] [string] $SaasSubscriptionId,
+    [Parameter(Mandatory)] [string] $AzureSubscriptionId,
+    [Parameter(Mandatory)] [string] $PurchaserId,
+    [string] $EnableDomainJoin,
+    [string] $AdFQDN,
+    [string] $OrganizationalUnit,
+    [int]    $MetaSnapFrequency,
+    [string] $EnableDailySnapshot,
+    [string] $MetaSnapDailyTime,
+    [string] $EnableWeeklySnapshot,
+    [string] $MetaSnapWeeklyDay,
+    [string] $MetaSnapWeeklyTime,
+    [string] $EnableMonthlySnapshot,
+    [string] $MetaSnapMonthlyWeekday,
+    [string] $MetaSnapMonthlyTime,
+    [string] $MetaForceSnapMonthly
 )
 
-# Set up logging
-$logPath = "C:\CAEVES\Logs"
-$configPath = "C:\CAEVES\Config"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Create directories
-New-Item -Path "C:\CAEVES" -ItemType Directory -Force | Out-Null
-New-Item -Path $logPath -ItemType Directory -Force | Out-Null
-New-Item -Path $configPath -ItemType Directory -Force | Out-Null
+# ================================================================================================
+# Script-scoped constants
+# ================================================================================================
+$Script:CaevesRoot = 'C:\CAEVES'
+$Script:LogPath = 'C:\CAEVES\Logs'
+$Script:ConfigPath = 'C:\CAEVES\Config'
+$Script:ConfigFile = 'C:\CAEVES\Config\FCGConfig.json'
+$Script:LogFile = $Script:LogPath + '\Azure-Deployment.log'
+$Script:BootMarker = 'C:\CAEVES\boot.complete'
+$Script:TempPath = 'C:\Temp'
+$Script:WallpaperDir = 'C:\Windows\OEM'
+$Script:WallpaperPath = 'C:\Windows\OEM\CAEVES-wallpaper.jpg'
+$Script:CacheDirPath = 'G:\Cache'
+$Script:MaxSnapshotCount = 500
+$Script:MetadataVolume = 'F:\'
+$Script:EnvironmentName = 'Development'
 
-# Start logging
-Start-Transcript -Path "$logPath\Azure-Deployment.log" -Append
+# ================================================================================================
+# Region: Logging
+# ================================================================================================
+function Write-Log {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')][string]$Level = 'INFO'
+    )
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $entry = "[$timestamp] [$Level] $Message"
 
-try {
-    Write-Host "Starting CAEVES configuration..." -ForegroundColor Green
-    
-    # Build storage connection string
-    $storageConnectionString = "DefaultEndpointsProtocol=https;AccountName=$StorageAccountName;AccountKey=$StorageAccountKey;EndpointSuffix=core.windows.net"
-    
-    # Create configuration object
-    $config = @{
-        SaasOfferId             = $SaasOfferId
-        SaasSubscriptionId      = $SaasSubscriptionId
-        AzureSubscriptionId     = $AzureSubscriptionId
-        PurchaserId             = $PurchaserId
-        VMName                  = $vmName
-        ResourceGroupName       = $ResourceGroupName
-        SubscriptionId          = $subscriptionId
-        StorageAccountName      = $StorageAccountName
-        StorageConnectionString = $storageConnectionString
-        StorageAccountResourceId = $StorageAccountResourceId
-        ContainerName           = $ContainerName
-        SnapshotsContainerName  = $SnapshotsContainerName        
-        TableName               = $TableName
-        ProcessTableName        = $ProcessTableName
-        CaevesConfigTableName   = $CaevesConfigTableName
-        EnableDomainJoin        = $EnableDomainJoin
-        AdFQDN                  = $AdFQDN
-        VssHourlyRetention      = $VssHourlyRetention
-        VssDailyRetention       = $VssDailyRetention
-        VssMonthlyRetention     = $VssMonthlyRetention
-        VssYearlyRetention      = $VssYearlyRetention
-        MetaSnapFrequency       = $MetaSnapFrequency
-        MetaSnapDailyTime       = $MetaSnapDailyTime
-        MetaSnapWeeklyDay       = $MetaSnapWeeklyDay
-        MetaSnapWeeklyTime      = $MetaSnapWeeklyTime
-        MetaSnapMonthlyWeekday  = $MetaSnapMonthlyWeekday
-        MetaSnapMonthlyTime     = $MetaSnapMonthlyTime
-        OrganizationalUnit      = $OrganizationalUnit
-        DeploymentDate          = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $color = switch ($Level) {
+        'INFO' { 'Cyan' }
+        'WARN' { 'Yellow' }
+        'ERROR' { 'Red' }
+        'DEBUG' { 'Gray' }
     }
-        
-    # Save configuration to JSON file
-    $config | ConvertTo-Json -Depth 10 | Out-File -FilePath "$configPath\FCGConfig.json" -Encoding UTF8
-    
-    Write-Host "Configuration file created successfully at: $configPath\FCGConfig.json" -ForegroundColor Green
-    
-    # Validate storage account connectivity
-    Write-Host "Validating storage account connectivity..." -ForegroundColor Yellow
-    
-    $context = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
-    
-    # Check if container exists
-    $container = Get-AzStorageContainer -Name $ContainerName -Context $context -ErrorAction SilentlyContinue
-    if (-not $container) {
-        Write-Warning "Container '$ContainerName' not found. It may be created by another process."
-    }
-    else {
-        Write-Host "Container '$ContainerName' validated successfully." -ForegroundColor Green
+    Write-Host $entry -ForegroundColor $color
+    Add-Content -Path $Script:LogFile -Value $entry -ErrorAction SilentlyContinue
+}
+
+# ==============================================================================================
+# Region: Disk Initialization
+# ==============================================================================================
+function Initialize-CaevesDataDisks {
+    Write-Log 'Initializing data disks with custom partitioning...'
+
+    # Get-Disk directly via IsBoot is faster than traversing Get-Partition | Get-Disk
+    $allDisks = Get-Disk
+    $osDisk = $allDisks | Where-Object { $_.IsBoot -eq $true }
+    $dataDisks = $allDisks | Where-Object { $_.Number -ne $osDisk.Number -and $_.PartitionStyle -eq 'RAW' }
+
+    if ($dataDisks.Count -lt 2) {
+        Write-Log "Expected 2 uninitialized data disks. Found $($dataDisks.Count). Skipping initialization." -Level WARN
+        exit 1
     }
 
-    # Check if snapshot container exists
-    $container = Get-AzStorageContainer -Name $SnapshotsContainerName -Context $context -ErrorAction SilentlyContinue
-    if (-not $container) {
-        Write-Warning "Container '$SnapshotsContainerName' not found. It may be created by another process."
-    }
-    else {
-        Write-Host "Container '$SnapshotsContainerName' validated successfully." -ForegroundColor Green
-    }
-    
-    # Check if table exists
-    $table = Get-AzStorageTable -Name $TableName -Context $context -ErrorAction SilentlyContinue
-    if (-not $table) {
-        Write-Warning "Table '$TableName' not found. It may be created by another process."
-    }
-    else {
-        Write-Host "Table '$TableName' validated successfully." -ForegroundColor Green
+    # Log disk locations for diagnostics
+    $dataDisks | ForEach-Object { Write-Log "Disk $($_.Number) Location: '$($_.Location)'" }
+
+    # Identify disks by LUN (works on WS2022 with SCSI controller: "...LUN 0", "...LUN 1")
+    $fixedDisk = $dataDisks | Where-Object { $_.Location -match "LUN\s*0\b" }
+    $sliderDisk = $dataDisks | Where-Object { $_.Location -match "LUN\s*1\b" }
+
+    # Fallback for WS2025 Azure Edition (NVMe controller reports a different Location format)
+    # Azure guarantees data disks are enumerated in LUN-attachment order, so sort by disk number.
+    if (-not $fixedDisk -or -not $sliderDisk) {
+        Write-Log "LUN-based disk identification failed (Location format may differ on this OS). Falling back to disk-number ordering." -Level WARN
+        $sortedDisks = $dataDisks | Sort-Object -Property Number
+        $fixedDisk = $sortedDisks[0]   # lowest disk number = LUN 0
+        $sliderDisk = $sortedDisks[1]   # next disk number  = LUN 1
     }
 
-    # Check if table exists
-    $processTable = Get-AzStorageTable -Name $ProcessTableName -Context $context -ErrorAction SilentlyContinue
-    if (-not $processTable) {
-        Write-Warning "Table '$ProcessTableName' not found. It may be created by another process."
-    }
-    else {
-        Write-Host "Table '$ProcessTableName' validated successfully." -ForegroundColor Green
+    if (-not $fixedDisk -or -not $sliderDisk) {
+        Write-Log "Could not identify both fixed and slider disks correctly. Skipping initialization." -Level WARN
+        exit 1
     }
 
-    # Check if CAEVES Config table exists
-    $caevesConfigTable = Get-AzStorageTable -Name $CaevesConfigTableName -Context $context -ErrorAction SilentlyContinue
-    if (-not $caevesConfigTable) {
-        Write-Warning "Table '$CaevesConfigTableName' not found. It may be created by another process."
-    }
-    else {
-        Write-Host "Table '$CaevesConfigTableName' validated successfully." -ForegroundColor Green
-    }
-    
-    # -------------------------------------------------------------------------------------------------------------
-    # Main First Boot Functions: Put all functions here
-    # 0.9.6 - June 6, 2025 - Jaap van Duijvenbode
-    # 0.9.7 - October 17, 2025 - Archana Patil - Adjusted Data Disk Initialization for new partitioning scheme	
-    # -------------------------------------------------------------------------------------------------------------
+    # Initialize GPT
+    Initialize-Disk -Number $fixedDisk.Number  -PartitionStyle GPT -PassThru | Out-Null
+    Initialize-Disk -Number $sliderDisk.Number -PartitionStyle GPT -PassThru | Out-Null
 
-        function Initialize-DataDisks {
-        Write-Output "Initializing data disks with custom partitioning..."
+    # Refresh after initialization
+    $fixedDisk = Get-Disk -Number $fixedDisk.Number
+    $sliderDisk = Get-Disk -Number $sliderDisk.Number
 
-        # Get the OS disk
-        $osDisk = Get-Partition | Where-Object { $_.DriveLetter -eq "C" } | Get-Disk
+    Write-Log "Fixed  Disk (LUN 0): Disk $($fixedDisk.Number),  $([math]::Round($fixedDisk.Size / 1GB, 1))GB"
+    Write-Log "Slider Disk (LUN 1): Disk $($sliderDisk.Number), $([math]::Round($sliderDisk.Size / 1GB, 1))GB"
 
-        # Get all uninitialized (RAW) data disks excluding OS disk
-        $dataDisks = Get-Disk | Where-Object { $_.Number -ne $osDisk.Number -and $_.PartitionStyle -eq 'RAW' }
+    # --- Fixed disk: 90% Snapshots (no letter) + 10% Metadata (F:) ---
+    $fixedSize = $fixedDisk.Size
+    $snapshotSize = [math]::Floor($fixedSize * 0.90) - 1000000000   # leave 1 GB unallocated
+    $metadataSize = [math]::Floor($fixedSize * 0.10)
 
-        if ($dataDisks.Count -lt 2) {
-            Write-Warning "Expected 2 uninitialized data disks. Found $($dataDisks.Count). Skipping initialization."
-            return
+    $volSnapshot = New-Partition -DiskNumber $fixedDisk.Number -Size $snapshotSize
+    Format-Volume -Partition $volSnapshot -FileSystem NTFS -NewFileSystemLabel 'Snapshots' -Confirm:$false | Out-Null
+
+    $volMetadata = New-Partition -DiskNumber $fixedDisk.Number -Size $metadataSize -DriveLetter F
+    Format-Volume -Partition $volMetadata -FileSystem NTFS -NewFileSystemLabel 'Metadata'  -Confirm:$false | Out-Null
+
+    # --- Slider disk: Cache (G:) ---
+    $volCache = New-Partition -DiskNumber $sliderDisk.Number -UseMaximumSize -DriveLetter G
+    Format-Volume -Partition $volCache -FileSystem NTFS -NewFileSystemLabel 'Cache' -Confirm:$false | Out-Null
+
+    Write-Log "Fixed  disk partitioned: F: (Metadata $([math]::Round($metadataSize/1GB,1))GB), unlabelled (Snapshots $([math]::Round($snapshotSize/1GB,1))GB)"
+    Write-Log "Slider disk partitioned: G: (Cache $([math]::Round($sliderDisk.Size/1GB,1))GB)"
+}
+
+# ==============================================================================================
+# Region: Permissions Configuration for Metadata Volume
+# Note: The Metadata volume will be used for CAEVES configuration and must be accessible by the CAEVES service process, which runs under the Local Service account. 
+#       By default, newly formatted volumes grant full access to Administrators and SYSTEM, but only read & execute permissions to Local Service. 
+#       We need to grant Local Service full control over the Metadata volume (F:) to ensure CAEVES can read/write its configuration and state.
+# ==============================================================================================
+function Set-PermissionsToMetadataVolume {
+    try {
+        Write-Output "Checking for F: drive..."
+
+        $timeout = 300
+        $elapsed = 0
+
+        while (!(Test-Path "F:\")) {
+            if ($elapsed -ge $timeout) {
+                throw "F: drive not available within timeout."
+            }
+            Start-Sleep -Seconds 5
+            $elapsed += 5
         }
 
-		# Identify disks by LUN
-        $fixedDisk = $dataDisks | Where-Object { $_.Location -match "LUN 0" }
-        $sliderDisk = $dataDisks | Where-Object { $_.Location -match "LUN 1" }
+        Write-Output "F: drive found. Running icacls..."
 
-        # Optional: Display the disks
-        Write-Output "Fixed Disk (LUN 0): $($fixedDisk.Number)"
-        Write-Output "Slider Disk (LUN 1): $($sliderDisk.Number)"
+        # icacls F:\    : target the root of the Metadata volume
+        #/inheritance:d : disable inheritance and remove inherited ACEs (we'll set explicit permissions)
+        #/t             : (recursive) Applies the change to *all files and folders inside F:*
+        #/c             : (continue on error) Continues execution even if some files throw errors (e.g., locked/system files)
+        $result = icacls F:\ /inheritance:d /t /c
 
-        # Identify fixed and slider disks
-        #$fixedDisk = $dataDisks | Where-Object { $_.Number -eq 1 }
-        #$sliderDisk = $dataDisks | Where-Object { $_.Number -eq 2 }
+        Write-Output $result
+        Write-Output "Completed successfully."
 
-        if (-not $fixedDisk -or -not $sliderDisk) {
-            Write-Warning "Could not identify both fixed and slider disks correctly. Skipping initialization."
-            return
-        }
-
-        # Initialize both disks
-        Initialize-Disk -Number $fixedDisk.Number -PartitionStyle GPT -PassThru | Out-Null
-        Initialize-Disk -Number $sliderDisk.Number -PartitionStyle GPT -PassThru | Out-Null
-
-        # Refresh disk objects
-        $fixedDisk = Get-Disk -Number $fixedDisk.Number
-        $sliderDisk = Get-Disk -Number $sliderDisk.Number
-
-		Write-Output "Fixed Disk (LUN 0): $($fixedDisk.Number) : size of disk : $($fixedDisk.Size) "
-        Write-Output "Slider Disk (LUN 1): $($sliderDisk.Number) : size of disk : $($sliderDisk.Size) "
-
-        # --- Fixed Disk (1024GB): Metadata + Snapshots ---
-        $fixedSize = $fixedDisk.Size
-        $metadataSize = [math]::Floor($fixedSize * 0.10)
-        $snapshotSize = [math]::Floor($fixedSize * 0.90) - 1000000000  # Leave 1GB unallocated
-
-        # Create Snapshots partition (no drive letter)
-        $volSnapshot = New-Partition -DiskNumber $fixedDisk.Number -Size $snapshotSize
-        Format-Volume -Partition $volSnapshot -FileSystem NTFS -NewFileSystemLabel "Snapshots" -Confirm:$false
-
-        # Create Metadata partition (F:)
-        $volMetadata = New-Partition -DiskNumber $fixedDisk.Number -Size $metadataSize -DriveLetter F
-        Format-Volume -Partition $volMetadata -FileSystem NTFS -NewFileSystemLabel "Metadata" -Confirm:$false        
-
-        # --- Slider Disk: Cache (G:) ---
-        $volCache = New-Partition -DiskNumber $sliderDisk.Number -UseMaximumSize -DriveLetter G
-        Format-Volume -Partition $volCache -FileSystem NTFS -NewFileSystemLabel "Cache" -Confirm:$false
-
-        Write-Output "Disks initialized:"
-        Write-Output "Fixed Disk (1024GB): F: (Metadata), No letter (Snapshots) Size : $($fixedDisk.Size)"
-        Write-Output "Slider Disk (128GB–8192GB): G: (Cache) Size : $($sliderDisk.Size)"
-    }    
-
-    # Function to get IV for AES encryption
-    function Get-IV {
-        return [System.Convert]::FromBase64String("SFIkMnBJakhSJDJwSWoxMg==") # 16 bytes
     }
-    function Get-LegalKey {
-        param (
-            [string]$Key,
-            [System.Security.Cryptography.SymmetricAlgorithm]$CryptoAlgorithm
-        )
-
-        $sTemp = $null
-        $lessSize = 0
-        $moreSize = 128
-
-        while (($Key.Length * 8) -gt $moreSize) {
-            $lessSize = $moreSize
-            $moreSize += 64
-        }
-
-        $sTemp = $Key.PadRight($moreSize / 8, ' ')
-
-        # Convert the secret key to a byte array
-        return [System.Text.Encoding]::ASCII.GetBytes($sTemp)
+    catch {
+        Write-Error "Failed to apply permissions: $_"
     }
-    function Encrypt-String {
-        param (
-            [string]$PlainText
-        )
+}
 
-        $aes = [System.Security.Cryptography.Aes]::Create()
-        $aes.Key = Get-LegalKey "36C032E6"
-        $aes.IV = Get-IV
+# ===========================================================================================
+# Region: AES Encryption Helpers
+# ===========================================================================================
+function Get-AesIV {
+    return [System.Convert]::FromBase64String('SFIkMnBJakhSJDJwSWoxMg==')  # 16 bytes
+}
 
-        $memoryStream = New-Object System.IO.MemoryStream
-        $encryptor = $aes.CreateEncryptor()
+function Get-AesKey {
+    param ([string] $RawKey)
 
-        $cryptoStream = New-Object System.Security.Cryptography.CryptoStream ( $memoryStream, $encryptor, [System.Security.Cryptography.CryptoStreamMode]::Write)
+    $moreSize = 128
+    while (($RawKey.Length * 8) -gt $moreSize) { $moreSize += 64 }
+    $padded = $RawKey.PadRight($moreSize / 8, ' ')
+    return [System.Text.Encoding]::ASCII.GetBytes($padded)
+}
 
-        $plainBytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
-        $cryptoStream.Write($plainBytes, 0, $plainBytes.Length)
-        $cryptoStream.FlushFinalBlock()
+function ConvertTo-EncryptedString {
+    param ([Parameter(Mandatory)] [string] $PlainText)
 
-        $cryptoStream.Close()
-        $aes.Dispose()
-        $encryptedBytes = $memoryStream.ToArray()
-        $memoryStream.Close()
+    $aes = [System.Security.Cryptography.Aes]::Create()
+    $aes.Key = Get-AesKey '36C032E6'
+    $aes.IV = Get-AesIV
 
-        return [Convert]::ToBase64String($encryptedBytes)
-    }
+    $ms = New-Object System.IO.MemoryStream
+    $encryptor = $aes.CreateEncryptor()
+    $cs = New-Object System.Security.Cryptography.CryptoStream($ms, $encryptor, [System.Security.Cryptography.CryptoStreamMode]::Write)
 
-    # -------------------------------------------------------------------------------------------------------------
-    # Main First Boot Execution: Partitioning Data Disk, Re-applying Wallpaper, Installing CAEVES Software
-    # 0.9.6 - June 6, 2025 - Jaap van Duijvenbode
-    # -------------------------------------------------------------------------------------------------------------
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($PlainText)
+    $cs.Write($bytes, 0, $bytes.Length)
+    $cs.FlushFinalBlock()
+    $cs.Close()
+    $aes.Dispose()
 
-    $marker = "C:\CAEVES\boot.complete"
-    if (Test-Path $marker) {
-        Write-Output "CAEVES already provisioned. Exiting."
-        exit 0
-    }
+    $result = [Convert]::ToBase64String($ms.ToArray())
+    $ms.Close()
+    return $result
+}
 
-    Write-Output "Running CAEVES first boot provisioning..."
+# =========================================================================================
+# Region: Wallpaper
+# =========================================================================================
+function Set-CaevesWallpaper {
+    <#
+    .SYNOPSIS
+        Downloads the CAEVES wallpaper and applies it to all existing user profiles and the current session.
+    #>
+    Write-Log 'Applying CAEVES wallpaper...'
 
-    # Step 1: Initialize disk
-    Initialize-DataDisks
+    New-Item -Path $Script:WallpaperDir -ItemType Directory -Force | Out-Null
+    # Start-BitsTransfer is significantly faster than Invoke-WebRequest for large file downloads
+    Start-BitsTransfer -Source 'https://caeveswebassets.blob.core.windows.net/caevesbuildimage/CAEVES-Windows-BG-2025.jpg' `
+        -Destination $Script:WallpaperPath
 
-    # Step 2: Re-apply wallpaper (optional)
-    # Define desired wallpaper settings
-
-    $wallpaper = "C:\WINDOWS\OEM\CAEVES-wallpaper.jpg"
-    Invoke-WebRequest -Uri "https://caeveswebassets.blob.core.windows.net/caevesbuildimage/CAEVES-Windows-BG-2025.jpg" -OutFile $wallpaper 
-
-    $wallpaperPath = 'C:\Windows\OEM\CAEVES-wallpaper.jpg'
-    $wallpaperStyle = '0'  # 0 = Centered
-
-    # Enumerate all user SIDs in HKEY_USERS
+    # Apply to all existing user registry hives
     $usersRoot = 'Registry::HKEY_USERS'
+    $wallpaperStyle = '0'   # 0 = Centered
     Get-ChildItem -Path $usersRoot | ForEach-Object {
         $sid = $_.PSChildName
-
-        # Skip default/system profiles
         if ($sid -match '^S-1-5-21-\d+-\d+-\d+-\d+$') {
-            $desktopKeyPath = "$usersRoot\$sid\Control Panel\Desktop"
-
+            $desktopKey = "$usersRoot\$sid\Control Panel\Desktop"
             try {
-                if (Test-Path -Path $desktopKeyPath) {
-                    Set-ItemProperty -Path $desktopKeyPath -Name 'Wallpaper' -Value $wallpaperPath
-                    Set-ItemProperty -Path $desktopKeyPath -Name 'WallpaperStyle' -Value $wallpaperStyle
-                    Write-Output "Updated wallpaper settings for user SID: $sid"
+                if (Test-Path -Path $desktopKey) {
+                    Set-ItemProperty -Path $desktopKey -Name 'Wallpaper'      -Value $Script:WallpaperPath
+                    Set-ItemProperty -Path $desktopKey -Name 'WallpaperStyle' -Value $wallpaperStyle
+                    Write-Log "Wallpaper updated for SID: $sid"
                 }
                 else {
-                    Write-Warning "Desktop key not found for SID: $sid"
+                    Write-Log "Desktop registry key not found for SID: $sid" -Level WARN
                 }
             }
             catch {
-                Write-Error "Failed to update settings for SID: $sid. Error: $_"
+                Write-Log "Failed to update wallpaper for SID $sid : $_" -Level WARN
             }
         }
     }
 
-    # OPTIONAL: Apply wallpaper immediately for current user session
-    Add-Type @"
+    # Apply immediately to the current session via Win32 API
+    # Guard Add-Type: compiling C# on every run adds ~1-2s; skip if already loaded in this session
+    if (-not ([System.Management.Automation.PSTypeName]'NativeMethods').Type) {
+        Add-Type @'
 using System.Runtime.InteropServices;
 public class NativeMethods {
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
 }
-"@
-
+'@
+    }
     $SPI_SETDESKWALLPAPER = 0x0014
-    $SPIF_UPDATEINIFILE = 0x01
-    $SPIF_SENDCHANGE = 0x02
+    $result = [NativeMethods]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $Script:WallpaperPath, 0x01 -bor 0x02)
+    if ($result) { Write-Log 'Wallpaper applied to current session.' }
+    else { Write-Log 'Wallpaper update failed for current session (non-interactive).' -Level WARN }
 
-    $result = [NativeMethods]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $wallpaperPath, $SPIF_UPDATEINIFILE -bor $SPIF_SENDCHANGE)
-    if ($result) {
-        Write-Output "Wallpaper applied to current session."
-    }
-    else {
-        Write-Warning "Wallpaper update failed for current session."
-    } 
-
-    # Updating Deskop Icon for FCGUI Working Directory
-    $WshShell = New-Object -ComObject WScript.Shell
-    $shortcut = $WshShell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
-    $shortcut.WorkingDirectory = "C:\Program Files\Caeves\FCGUI"
+    # Update CAEVES Configuration desktop shortcut
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
+    $shortcut.WorkingDirectory = 'C:\Program Files\Caeves\FCGUI'
     $shortcut.Save()
+    Write-Log 'Desktop shortcut updated.'
+}
 
-    # Suppress Network Location Prompt on First Login
+# ---------------------- HELPER FUNCTIONS -----------------------------------------
+# CAEVES Snapshot Scheduling and VSS Shadow Storage Configuration
+# Note: This section assumes the Snapshots and Metadata volumes are on the same disk (as configured in Initialize-DataDisks) 
+# and that the Snapshots volume is large enough to accommodate shadow storage for the Metadata volume.
 
-    # Disable Server Manager on Login
-
-    # Step 3: Install CAEVES software
-	# Set environment variable to respective environment. 
-    Write-Host "Setting environment to Development."
-    [System.Environment]::SetEnvironmentVariable("DOTNET_ENVIRONMENT", "Development", "Machine")
-
-    # Download CAEVES software
-    Write-Host "Downloading CAEVES software"
-    $downloads = @(
-        "https://caeveswebassets.blob.core.windows.net/caevesbuildimage/build/CAEVES.FCG.App_Release.msi"
-    )
-
-    # Initiate the installation
-    $downloads | ForEach-Object {
-        $file = "C:\Temp\" + [System.IO.Path]::GetFileName($_)
-        Invoke-WebRequest $_ -OutFile $file
-        Write-Host "Installing CAEVES software: $file"
-        Start-Process -FilePath $file -ArgumentList "/quiet" -Wait
+function Assert-Administrator {
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Please run this script in an elevated PowerShell (Run as Administrator)."
     }
+}
 
-    # Step 4: Optional environment variable
-    [System.Environment]::SetEnvironmentVariable("CAEVESEnabled", "True", "Machine")
-
-    # Step 5: Mark setup complete
-    New-Item -ItemType File -Path $marker -Force
-    Write-Output "CAEVES first boot complete."
-
-    # -------------------------------------------------------------------------------------------------------------
-    # Configure CAEVES FCG Agent on the customer's provisioned VM instance using C:\CAEVES\Config\FCGConfig.json
-    # 0.9.6 - June 6, 2025 - Jaap van Duijvenbode
-    # -------------------------------------------------------------------------------------------------------------
-
-    $paramFile = "C:\CAEVES\Config\FCGConfig.json"
-
-    if (Test-Path $paramFile) {
-        $params = Get-Content $paramFile | ConvertFrom-Json
-        $storageaccount = $params.StorageAccountName
-        
-        Write-Output "Configuring Storage Account: $storageaccount";
-
-        $container = $params.ContainerName
-
-        Write-Output "Configuring Storage Container: $container";
-
-        $connectionstring = $params.StorageConnectionString
-        $encryptedconnectionstring = Encrypt-String $connectionstring
-
-        Write-Host "Encrypted Connection String : $encryptedconnectionstring"
-         
-        Write-Output "Configuring Storage Connection: $connectionstring";
-
-        $metasnapfrequency = $params.MetaSnapFrequency
-        $metasnapfrequency = $metasnapfrequency * 60
-
-        Write-Output "Configuring Metadata Snapshot Frequency: $metasnapfrequency";
-
-        $table = $params.TableName
-        Write-Output "Configuring Azure Table: $table";
-
-        $processTable = $params.ProcessTableName
-        Write-Output "Configuring Azure Table: $processTable";
-
-        # Base key
-        $baseKey = 'HKLM:\SOFTWARE\Caeves'
-
-        # Ensure base structure
-        New-Item -Path $baseKey -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\BEConfig" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\DirtyLog" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\FlushLog" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\FSConfig" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\VolumeConfig" -Force | Out-Null
-        New-Item -Path "$baseKey\GatewayConfig\LicenseConfig" -Force | Out-Null
-        
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\LicenseConfig" -Name "SaasSubscriptionId" -Value "$SaasSubscriptionId"
-
-        # Set values for Storage Account
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "StorageConnectionString" -Value "$encryptedconnectionstring"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "ContainerName" -Value "$container"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "StorageType" -Value "azureblob"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "HealthSymbol" -Value "success"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "SnapshotsContainerName" -Value "$SnapshotsContainerName"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "MetadataTableName" -Value "$table"        
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "MetadataTableNameQueue" -Value "$processTable"
-		Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "CaevesConfigTableName" -Value "$CaevesConfigTableName"
-		
-		Write-Output "Storage Account Resource ID : $StorageAccountResourceId"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "StorageAccountResourceId" -Value $StorageAccountResourceId -Type String -Force
-		Set-ItemProperty -Path "$baseKey\GatewayConfig\BEConfig\$storageaccount" -Name "StorageAccountName" -Value "$storageaccount"
-
-		Set-ItemProperty -Path "$baseKey\GatewayConfig\FSConfig" -Name "PurgeOnFlush" -Value 1 -Type DWord
-
-        # Set VolumeConfig CacheCleanerSchedulerFrequency (DWORD: 480)
-        #Set-ItemProperty -Path "$baseKey\GatewayConfig\FSConfig" -Name "CacheCleanerSchedulerFrequency" -Value $CacheCleanerSchedulerFrequency -Type DWord
-
-        # Set VolumeConfig MetaSnapSchedulerFrequency (DWORD: 480)
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\VolumeConfig" -Name "MetaSnapSchedulerFrequency" -Value $metasnapfrequency -Type DWord
-
-        # Set F: as Metadata Volume in ADS using FCGMFMarkVolumeAsMetadataVolume
-        Write-Output "Configuring Volume Mapping & Cache: F: + G:\Cache\";
-
-        # Define the functions from the DLL
-
-        [Environment]::SetEnvironmentVariable("PATH", [Environment]::GetEnvironmentVariable("PATH", "User") + ";C:\Program Files\CAEVES\FCGAgent\", "User")
-
-        Add-Type -MemberDefinition @"
-    [DllImport("C:\\Program Files\\Caeves\\FCGAgent\\fcgmfmetadatahelper.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint FCGMFMarkVolumeAsMetadataVolume(
-     [InAttribute()] [MarshalAsAttribute(UnmanagedType.LPWStr)]
-     string volName, 
-
-     [InAttribute()] [MarshalAsAttribute(UnmanagedType.LPWStr)]
-     string volGuid,
-
-     [InAttribute()] [MarshalAsAttribute(UnmanagedType.LPWStr)]
-     string topLevelDirName,
-
-     [InAttribute()] [MarshalAsAttribute(UnmanagedType.LPWStr)]
-     string cacheDirName);
-
-    [DllImport("C:\\Program Files\\Caeves\\FCGAgent\\fcgmfmetadatahelper.dll", CharSet = CharSet.Unicode, CallingConvention = CallingConvention.Cdecl)]
-    public static extern uint FCGMFSetGlobalCacheDirectory(
-     [InAttribute()] [MarshalAsAttribute(UnmanagedType.LPWStr)]
-     string cacheDirPath);
-"@ -Name "FCGLibV3" -Namespace "FCGNamespace"
-
-        # Call the function FCGMFMarkVolumeAsMetadataVolume
-        $volume = Get-WmiObject -Class Win32_Volume | Where-Object { $_.Label -eq "Metadata" }
-        if ($volume) {
-            Write-Host "Drive Letter: $($volume.DriveLetter)" -ForegroundColor Yellow
-            Write-Host "Label: $($volume.Label)" -ForegroundColor Yellow
-            Write-Host "File System: $($volume.FileSystem)" -ForegroundColor Yellow
-            Write-Host "Volume GUID: $($volume.DeviceID)"  -ForegroundColor Cyan
-        }
-        else {
-            Write-Warning "F: drive not found using WMI method"
-        }
-
-        $volName = "F:"
-        $volGuid = $volGuid = [guid]::NewGuid().ToString()
-        $topLevelDirName = "FCGContainer"
-        $cacheDirPath = "G:\Cache"
-
-        $result = [FCGNamespace.FCGLibV3]::FCGMFMarkVolumeAsMetadataVolume($volName, $volGuid, $topLevelDirName, "")
-        if ($result -eq 0) {
-            Write-Output "Success"
-        }
-        Write-Output "Result of FCGMFMarkVolumeAsMetadataVolume: $result"
-
-        # Call the function FCGMFSetGlobalCacheDirectory
-        $resultOfSetDirectory = [FCGNamespace.FCGLibV3]::FCGMFSetGlobalCacheDirectory($cacheDirPath)
-        if ($resultOfSetDirectory -eq 0) {
-            Write-Output "Global Cache Directory set successfully."
-        }
-        Write-Output "Result of FCGMFSetGlobalCacheDirectory: $resultOfSetDirectory" 
-
-        # Set FSConfig CacheFolder
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\FSConfig" -Name "CacheFolder" -Value "G:\Cache"
-
-        # Set VolumeConfig\F: keys
-        New-Item -Path "$baseKey\GatewayConfig\VolumeConfig\F:" -Force | Out-Null
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\VolumeConfig\F:" -Name "PrimaryAlias" -Value "$StorageAccountName"
-        Set-ItemProperty -Path "$baseKey\GatewayConfig\VolumeConfig\F:" -Name "SecondaryAlias" -Value @($StorageAccountName) -Type MultiString
-
-        # Create FCGContainer folder on F:\ and CACHE folder on G:\
-        New-Item -ItemType Directory -Path F:\FCGContainer -Force | Out-Null
-        New-Item -ItemType Directory -Path F:\FCGContainer\$StorageAccountName -Force | Out-Null   
-        New-Item -ItemType Directory -Path G:\Cache -Force | Out-Null 
-
-        # Create SMB file share \\...\CAEVES-[storageaccount] and optional NFS export
-        $shareName = "CAEVES-$StorageAccountName"
-        $sharePath = "F:\FCGContainer\$StorageAccountName\"
-        New-SmbShare -Name $shareName -Path $sharePath -FullAccess "Everyone" -Description "CAEVES Share for $StorageAccountName"
-        
-        # Manually Start FCG Agent and FCG MF
-        Start-Service -Name fcgmf
-        Start-Service -Name FileCloudGatewayService 
-        
-        Write-Host "CAEVES Registry keys and Service Controls created/updated successfully."
-
+function Get-VolumeByLabel {
+    param([Parameter(Mandatory)][string]$Label)
+    $vols = Get-CimInstance -ClassName Win32_Volume -Filter "Label='$Label'"
+    if (-not $vols) { throw "No volume with label '$Label' was found." }
+    if ($vols.Count -gt 1) {
+        throw "Multiple volumes with label '$Label' were found. Please ensure the label is unique."
     }
+    return $vols
+}
 
-    # -------------------------------------------------------------------------------------------------------------
-    # Update the registy value for Maximum Shadow Copy count  : November 17, 2025  - Archana Patil
-    # -------------------------------------------------------------------------------------------------------------
-
-    # Define the registry path and key details
-    $regPath = "HKLM:\System\CurrentControlSet\Services\VSS\Settings"
-    $keyName = "MaxShadowCopies"
-    $keyValue = 512
-
-    # Create the registry path if it doesn't exist
-    if (-not (Test-Path $regPath)) {
-        New-Item -Path $regPath -Force | Out-Null
-    }
-
-    # Create or update the DWORD value
-    New-ItemProperty -Path $regPath -Name $keyName -Value $keyValue -PropertyType DWord -Force | Out-Null
-
-    # Verify the change
-    Write-Output "Registry key updated successfully:"
-    Get-ItemProperty -Path $regPath | Select-Object $keyName		
-
-    # -------------------------------------------------------------------------------------------------------------
-    # Create record in CAEVES Metrics & Billing Table  : June 12, 2025  - Jaap van Duijvenbode
-    # Updated Metering API call : September 7, 2025 - Archana Patil
-    # -------------------------------------------------------------------------------------------------------------
-
-	# Construct JSON payload
-	$payload = @{
-		action = "init"
-		marketplaceid = $SaasSubscriptionId
-		storageaccountname = $StorageAccountName
-	} | ConvertTo-Json -Depth 3
-	Write-Host "[UpdateStorageCapacityAsync] Constructed Payload: $payload"
-
-	# Construct endpoint URL
-	$uri = "https://caevessaashelperfunc-dev.azurewebsites.net/api/UpsertCaevesCapacityMetrics?code=DK9f11RSFzokW-gATliApXTfciuejRMxX4FU7lUPw2JHAzFuoFd6GA=="
-
-	# Send POST request
-	try {
-		Write-Host "[UpdateStorageCapacityAsync] Invoking Capacity metrics update endpoint."
-		$response = Invoke-RestMethod -Uri $uri -Method Post -Body $payload -Headers @{"Content-Type" = "application/json" }
-		Write-Host "[UpdateStorageCapacityAsync] Update successful."
-	} catch {
-		Write-Error "[UpdateStorageCapacityAsync] Request failed: $_"
-	}
-
-    # -------------------------------------------------------------------------------------------------------------
-    # Configure CAEVES Snapshot Schedules
-    # June 6, 2025  - Jaap van Duijvenbode
-    # -------------------------------------------------------------------------------------------------------------
-
-    $MetadataVolume = $volName
-    $SnapshotsLabel = 'Snapshots'
-    $MaxSize = 'UNBOUNDED'
-    $MoveExistingShadowStorage = $false
-
-    function Assert-Administrator {
-        $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-            throw "Please run this script in an elevated PowerShell (Run as Administrator)."
-        }
-    }
-
-    function Get-VolumeByLabel {
-        param([Parameter(Mandatory)][string]$Label)
-        $vols = Get-CimInstance -ClassName Win32_Volume -Filter "Label='$Label'"
-        if (-not $vols) { throw "No volume with label '$Label' was found." }
-        if ($vols.Count -gt 1) {
-            throw "Multiple volumes with label '$Label' were found. Please ensure the label is unique."
-        }
-        return $vols
-    }
-
-    function Get-VolumeBySpecifier {
-        <#
+function Get-VolumeBySpecifier {
+    <#
     Accepts:
       - Drive letter (e.g. "F:")
       - Volume GUID path (e.g. "\\?\Volume{GUID}\")
   #>
-        param([Parameter(Mandatory)][string]$Specifier)
+    param([Parameter(Mandatory)][string]$Specifier)
 
-        if ($Specifier -match '^[A-Za-z]:$') {
-            $drive = $Specifier.ToUpper()
-            $vol = Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq $drive }
-            if (-not $vol) { throw "No volume with drive letter $drive was found." }
-            return $vol
-        }
-
-        if ($Specifier -like '\\?\Volume{*}\') {
-            $guid = $Specifier
-            $vol = Get-CimInstance Win32_Volume | Where-Object { $_.DeviceID -eq $guid }
-            if (-not $vol) { throw "No volume with GUID '$guid' was found." }
-            return $vol
-        }
-
-        throw "Unsupported MetadataVolume specifier '$Specifier'. Use a drive letter (e.g., 'F:') or a Volume GUID path (\\?\Volume{GUID}\)."
+    Write-Log "Resolving volume for specifier '$Specifier'..."
+    if ($Specifier -match '^[A-Za-z]:$') {
+        $drive = $Specifier.ToUpper()
+        $vol = Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq $drive }
+        if (-not $vol) { throw "No volume with drive letter $drive was found." }
+        return $vol
     }
 
-    function Normalize-VolumeGuid {
-        param([Parameter(Mandatory)][string]$DeviceId)
-        # Ensure it ends with a backslash, as vssadmin accepts that form.
-        if ($DeviceId.EndsWith('\')) { return $DeviceId }
-        return "$DeviceId\"
+    if ($Specifier -like '\\?\Volume{*}\') {
+        $guid = $Specifier
+        $vol = Get-CimInstance Win32_Volume | Where-Object { $_.DeviceID -eq $guid }
+        if (-not $vol) { throw "No volume with GUID '$guid' was found." }
+        return $vol
     }
 
-    function Invoke-VssAdmin {
-        param([Parameter(Mandatory)][string[]]$ArgumentList)
+    throw "Unsupported MetadataVolume specifier '$Specifier'. Use a drive letter (e.g., 'F:') or a Volume GUID path (\\?\Volume{GUID}\)."
+}
 
-        $exe = Join-Path $env:SystemRoot 'System32\vssadmin.exe'
+function Normalize-VolumeGuid {
+    param([Parameter(Mandatory)][string]$DeviceId)
+    # Ensure it ends with a backslash, as vssadmin accepts that form.
+    if ($DeviceId.EndsWith('\')) { return $DeviceId }
+    return "$DeviceId\"
+}
 
-        Write-Verbose ("Running: {0} {1}" -f $exe, ($ArgumentList -join ' '))
-        $output = & $exe @ArgumentList 2>&1
-        $exit = $LASTEXITCODE
-        [PSCustomObject]@{
-            ExitCode = $exit
-            Output   = ($output -join [Environment]::NewLine)
-        }
+function Invoke-VssAdmin {
+    param([Parameter(Mandatory)][string[]]$ArgumentList)
+
+    $exe = Join-Path $env:SystemRoot 'System32\vssadmin.exe'
+
+    Write-Verbose ("Running: {0} {1}" -f $exe, ($ArgumentList -join ' '))
+    $output = & $exe @ArgumentList 2>&1
+    $exit = $LASTEXITCODE
+    [PSCustomObject]@{
+        ExitCode = $exit
+        Output   = ($output -join [Environment]::NewLine)
     }
+}
 
-    function Current-ShadowStorageInfo {
-        param([Parameter(Mandatory)][string]$ForSpec)
+function Get-ShadowStorageInfo {
+    param([Parameter(Mandatory)][string]$ForSpec)
 
-        $res = Invoke-VssAdmin -ArgumentList @('list', 'shadowstorage', "/for=$ForSpec")
-        return $res.Output
-    }
+    $res = Invoke-VssAdmin -ArgumentList @('list', 'shadowstorage', "/for=$ForSpec")
+    return $res.Output
+}
 
-    function ShadowStorageExistsOn {
-        <#
+function ShadowStorageExistsOn {
+    <#
     Returns:
       - $true  if the metadata volume already uses the given /on target
       - $false if not
   #>
-        param(
-            [Parameter(Mandatory)][string]$ForSpec,
-            [Parameter(Mandatory)][string]$OnSpec
-        )
+    param(
+        [Parameter(Mandatory)][string]$ForSpec,
+        [Parameter(Mandatory)][string]$OnSpec
+    )
 
-        $info = Current-ShadowStorageInfo -ForSpec $ForSpec
-        if (-not $info) { return $false }
+    $info = Get-ShadowStorageInfo -ForSpec $ForSpec
+    if (-not $info) { return $false }
 
-        # Look for the "Shadow Copy Storage volume:" line containing the OnSpec (GUID or drive)
-        $normalizedOn = $OnSpec.TrimEnd('\').ToLowerInvariant()
-        foreach ($line in ($info -split "`r?`n")) {
-            if ($line -match 'Shadow Copy Storage volume:\s*(.+)$') {
-                $found = $Matches[1].Trim().TrimEnd('\').ToLowerInvariant()
-                if ($found -eq $normalizedOn) { return $true }
-            }
+    # Look for the "Shadow Copy Storage volume:" line containing the OnSpec (GUID or drive)
+    $normalizedOn = $OnSpec.TrimEnd('\').ToLowerInvariant()
+    foreach ($line in ($info -split "`r?`n")) {
+        if ($line -match 'Shadow Copy Storage volume:\s*(.+)$') {
+            $found = $Matches[1].Trim().TrimEnd('\').ToLowerInvariant()
+            if ($found -eq $normalizedOn) { return $true }
         }
-        return $false
     }
+    return $false
+}
+#---------------------------- END HELPER FUNCTIONS ----------------------------------------------
 
+
+#-------------------------------------------------------------------------------------------------------------------------------
+# Initialize Snapshot Configuration Process: Identify volumes, assign drive letter if needed, and set shadow storage for VSS
+#-------------------------------------------------------------------------------------------------------------------------------
+function Initialize-VssShadowStorage {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][string]$MetadataVolume,
+        [Parameter(Mandatory)][string]$SnapshotsLabel,
+        [Parameter(Mandatory)][string]$MaxSize
+    )
+    Write-Log "Locating Snapshots volume by label '$SnapshotsLabel'..."
+    $snapshotVolume = Get-VolumeByLabel -Label $SnapshotsLabel
+    $snapshotGuid = Normalize-VolumeGuid -DeviceId $snapshotVolume.DeviceID
+    Write-Log "Snapshots volume GUID: $snapshotGuid"
+
+    Write-Log "Resolving metadata volume '$MetadataVolume'..."
+    $metadVolume = Get-VolumeBySpecifier -Specifier $MetadataVolume
+    $metadataGuid = Normalize-VolumeGuid -DeviceId $metadVolume.DeviceID
+    Write-Log "Metadata volume GUID: $metadataGuid"
+
+    Set-ShadowStorage -ForSpec $metadataGuid -OnSpec $snapshotGuid -MaxSize $MaxSize
+}
+
+#------------------------------------------------------------------------------------------
+# Set up Shadow Storage for VSS on the Metadata volume, pointing to Snapshots volume
+#------------------------------------------------------------------------------------------
+function Set-ShadowStorage {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [Parameter(Mandatory)][string]$ForSpec,
+        [Parameter(Mandatory)][string]$OnSpec,
+        [Parameter(Mandatory)][string]$MaxSize,
+        [bool]$MoveExistingShadowStorage = $false
+    )
     try {
-        Assert-Administrator
-
-        Write-Host "Locating Snapshots volume by label '$SnapshotsLabel'..." -ForegroundColor Cyan
-        $snapVol = Get-VolumeByLabel -Label $SnapshotsLabel
-        $snapGuid = Normalize-VolumeGuid -DeviceId $snapVol.DeviceID
-        Write-Host "Snapshots volume GUID: $snapGuid"
-
-        if ($AssignSIfMissing -and -not $snapVol.DriveLetter) {
-            Write-Host "Assigning drive letter S: to Snapshots volume..." -ForegroundColor Cyan
-            # Ensure S: is available
-            if (Get-CimInstance Win32_Volume | Where-Object { $_.DriveLetter -eq 'S:' }) {
-                Write-Warning "Drive letter S: is already in use. Skipping letter assignment."
-            }
-            else {
-                if ($PSCmdlet.ShouldProcess("Snapshots volume $($snapVol.DeviceID)", "AddMountPoint S:\")) {
-                    $null = Invoke-CimMethod -InputObject $snapVol -MethodName AddMountPoint -Arguments @{ Directory = 'S:\' }
-                    Write-Host "Assigned drive letter S: to the Snapshots volume."
-                }
-            }
-        }
-
-        Write-Host "Resolving metadata volume '$MetadataVolume'..." -ForegroundColor Cyan
-        $metaVol = Get-VolumeBySpecifier -Specifier $MetadataVolume
-        $metaGuid = Normalize-VolumeGuid -DeviceId $metaVol.DeviceID
-        Write-Host "Metadata volume GUID: $metaGuid"
-
-        $forSpec = $metaGuid
-        $onSpec = $snapGuid
-
         # Try to create (idempotent-ish). If it already exists, vssadmin returns a nonzero exit;
         # we'll then try resize, and as a last resort (if requested) delete+add.
-        Write-Host "Configuring shadow storage (VSS) for metadata volume..." -ForegroundColor Cyan
+        Write-Log "Configuring shadow storage (VSS) for metadata volume..."
 
         $alreadyThere = ShadowStorageExistsOn -ForSpec $forSpec -OnSpec $onSpec
 
         if (-not $alreadyThere) {
-            Write-Host "No existing shadow storage on the Snapshots volume for $forSpec."
-            Write-Host "Attempting: vssadmin add shadowstorage /for=$forSpec /on=$onSpec /maxsize=$MaxSize"
+            Write-Log "No existing shadow storage on the Snapshots volume for $forSpec."
+            Write-Log "Attempting: vssadmin add shadowstorage /for=$forSpec /on=$onSpec /maxsize=$MaxSize"
             if ($PSCmdlet.ShouldProcess("VSS shadow storage for $forSpec", "add on $onSpec (maxsize=$MaxSize)")) {
                 $add = Invoke-VssAdmin -ArgumentList @('add', 'shadowstorage', "/for=$forSpec", "/on=$onSpec", "/maxsize=$MaxSize")
                 if ($add.ExitCode -eq 0) {
-                    Write-Host "Shadow storage association created." -ForegroundColor Green
+                    Write-Log "Shadow storage association created."
                 }
                 else {
-                    Write-Warning "Add failed (exit $($add.ExitCode)). Trying resize (may also move storage if supported)."
+                    Write-Log "Add failed (exit $($add.ExitCode)). Trying resize (may also move storage if supported)." -Level WARN
                     Write-Verbose $add.Output
 
                     if ($PSCmdlet.ShouldProcess("VSS shadow storage for $forSpec", "resize on $onSpec (maxsize=$MaxSize)")) {
                         $resize = Invoke-VssAdmin -ArgumentList @('resize', 'shadowstorage', "/for=$forSpec", "/on=$onSpec", "/maxsize=$MaxSize")
                         if ($resize.ExitCode -eq 0) {
-                            Write-Host "Shadow storage resized (and/or moved) successfully." -ForegroundColor Green
+                            Write-Log "Shadow storage resized (and/or moved) successfully."
                         }
                         else {
-                            Write-Warning "Resize failed (exit $($resize.ExitCode))."
+                            Write-Log "Resize failed (exit $($resize.ExitCode))." -Level WARN
                             Write-Verbose $resize.Output
 
                             if ($MoveExistingShadowStorage) {
-                                Write-Warning "About to delete existing shadow storage for $forSpec and recreate it on $onSpec."
+                                Write-Log "About to delete existing shadow storage for $forSpec and recreate it on $onSpec." -Level WARN
                                 if ($PSCmdlet.ShouldProcess("VSS shadow storage for $forSpec", "DELETE and re-ADD on $onSpec (this deletes existing shadow copies)")) {
                                     $del = Invoke-VssAdmin -ArgumentList @('delete', 'shadowstorage', "/for=$forSpec")
                                     if ($del.ExitCode -eq 0) {
                                         $add2 = Invoke-VssAdmin -ArgumentList @('add', 'shadowstorage', "/for=$forSpec", "/on=$onSpec", "/maxsize=$MaxSize")
                                         if ($add2.ExitCode -eq 0) {
-                                            Write-Host "Shadow storage moved to Snapshots volume." -ForegroundColor Green
+                                            Write-Log "Shadow storage moved to Snapshots volume."
                                         }
                                         else {
                                             throw "Failed to re-create shadow storage after deletion. Output:`n$($add2.Output)"
@@ -784,7 +477,7 @@ public class NativeMethods {
                                 }
                             }
                             else {
-                                Write-Warning "Existing shadow storage could not be moved automatically. Re-run with -MoveExistingShadowStorage to force a delete+add (this will delete existing shadow copies)."
+                                Write-Log "Existing shadow storage could not be moved automatically. Re-run with -MoveExistingShadowStorage to force a delete+add (this will delete existing shadow copies)." -Level WARN
                             }
                         }
                     }
@@ -792,46 +485,475 @@ public class NativeMethods {
             }
         }
         else {
-            Write-Host "Shadow storage for $forSpec is already set to the Snapshots volume. Ensuring max size..." -ForegroundColor Yellow
+            Write-Log "Shadow storage for $forSpec is already set to the Snapshots volume. Ensuring max size..."
             if ($PSCmdlet.ShouldProcess("VSS shadow storage for $forSpec", "resize (maxsize=$MaxSize)")) {
                 $resize2 = Invoke-VssAdmin -ArgumentList @('resize', 'shadowstorage', "/for=$forSpec", "/on=$onSpec", "/maxsize=$MaxSize")
                 if ($resize2.ExitCode -eq 0) {
-                    Write-Host "Shadow storage size verified/updated." -ForegroundColor Green
+                    Write-Log "Shadow storage size verified/updated."
                 }
                 else {
-                    Write-Warning "Resize returned exit $($resize2.ExitCode). Output:`n$($resize2.Output)"
+                    Write-Log "Resize returned exit $($resize2.ExitCode). Output:`n$($resize2.Output)" -Level WARN
                 }
             }
         }
 
-        Write-Host ""
-        Write-Host "Result for metadata volume:" -ForegroundColor Cyan
-        Write-Host (Current-ShadowStorageInfo -ForSpec $forSpec)
-        Write-Host "Done."
+        Write-Log "Result for metadata volume: $(Get-ShadowStorageInfo -ForSpec $forSpec)"
+        Write-Log "VSS shadow storage configuration complete."
+
     }
     catch {
-        Write-Error $_.Exception.Message
         throw
     } 
+}
+
+#-------------------------------------------------------------------------------------------------
+# Schedule Snapshot Tasks
+#-------------------------------------------------------------------------------------------------
+function Initialize-SnapshotTasks {
+
+    $schedules = @()
 
     # Set up scheduled tasks for snapshots if retention values are set
-    if ($VssHourlyRetention -gt 0 -or $VssDailyRetention -gt 0) {
-        Write-Host "Setting up VSS snapshot schedules..." -ForegroundColor Yellow
-        # Add your VSS scheduling logic here
+    Write-Log "Configuring snapshot schedules based on provided parameters..."
+
+    # Daily
+    if ($EnableDailySnapshot) {
+        $schedules += @{
+            Type = "Daily"
+            Time = $MetaSnapDailyTime
+        }
+        Write-Log "Daily    : Enabled=$EnableDailySnapshot, Time=$MetaSnapDailyTime"
     }
 
-  
-    Write-Host "CAEVES configuration completed successfully!" -ForegroundColor Green
-    
+    # Weekly
+    if ($EnableWeeklySnapshot) {
+        $schedules += @{
+            Type    = "Weekly"
+            WeekDay = $MetaSnapWeeklyDay
+            Time    = $MetaSnapWeeklyTime
+        }
+        Write-Log "Weekly   : Enabled=$EnableWeeklySnapshot,  Day=$MetaSnapWeeklyDay, Time=$MetaSnapWeeklyTime"
+    }
+
+    # Monthly
+    if ($EnableMonthlySnapshot) {
+        # Parse value like "LastSunday", "FirstMonday", etc.
+        if ($MetaSnapMonthlyWeekday -match '^(First|Second|Third|Fourth|Last)(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$') {        
+            $weekText = $matches[1]
+            $dayText = $matches[2]
+
+            $weekMap = @{
+                First  = 1
+                Second = 2
+                Third  = 3
+                Fourth = 4
+                Last   = -1
+            }
+            $weekOfMonth = $weekMap[$weekText]
+
+            $schedules += @{
+                Type        = "Monthly"
+                WeekDay     = $dayText
+                WeekOfMonth = $weekOfMonth
+                Time        = $MetaSnapMonthlyTime
+                ForceSnap   = $MetaForceSnapMonthly
+            }
+            Write-Log "Monthly  : Enabled=$EnableMonthlySnapshot, Weekday=$MetaSnapMonthlyWeekday, Time=$MetaSnapMonthlyTime, ForceSnap=$MetaForceSnapMonthly"
+        }
+        else {
+            throw "Invalid Monthly Weekday format: $MetaSnapMonthlyWeekday"
+        }
+    }
+
+    New-FCGSnapshotScheduler -Name "FCGSnapshotPolicy" -Schedules $schedules
+    Write-Log "Snapshot scheduling configuration complete."
 }
-catch {
-    Write-Error "Error during configuration: $_"
-    Write-Error $_.Exception.StackTrace
-    exit 1
+
+# =============================================================================================
+# Region: Provisioning Steps
+# =============================================================================================
+function Initialize-CaevesDirectories {
+    New-Item -Path $Script:CaevesRoot  -ItemType Directory -Force | Out-Null
+    New-Item -Path $Script:LogPath     -ItemType Directory -Force | Out-Null
+    New-Item -Path $Script:ConfigPath  -ItemType Directory -Force | Out-Null
+    New-Item -Path $Script:TempPath    -ItemType Directory -Force | Out-Null
 }
-finally {
-    Stop-Transcript
+
+#-------------------------------------------------------------------------------------------------
+# Build the configuration object from parameters and save it to disk for the CAEVES service to consume.
+#-------------------------------------------------------------------------------------------------
+function Save-CaevesConfiguration {
+    <#
+    .SYNOPSIS
+        Builds the FCGConfig.json from script parameters and writes it to the config directory.
+    #>
+    param ([string] $StorageConnectionString)
+
+    $config = [ordered]@{
+        SaasOfferId              = $SaasOfferId
+        SaasSubscriptionId       = $SaasSubscriptionId
+        AzureSubscriptionId      = $AzureSubscriptionId
+        PurchaserId              = $PurchaserId
+        VMName                   = $vmName
+        ResourceGroupName        = $ResourceGroupName
+        SubscriptionId           = $subscriptionId
+        StorageAccountName       = $StorageAccountName
+        StorageConnectionString  = $StorageConnectionString
+        StorageAccountResourceId = $StorageAccountResourceId
+        ContainerName            = $ContainerName
+        SnapshotsContainerName   = $SnapshotsContainerName
+        TableName                = $TableName
+        ProcessTableName         = $ProcessTableName
+        CaevesConfigTableName    = $CaevesConfigTableName
+        EnableDomainJoin         = $EnableDomainJoin
+        AdFQDN                   = $AdFQDN
+        OrganizationalUnit       = $OrganizationalUnit
+        MetaSnapFrequency        = $MetaSnapFrequency
+        EnableDailySnapshot      = $EnableDailySnapshot
+        MetaSnapDailyTime        = $MetaSnapDailyTime
+        EnableWeeklySnapshot     = $EnableWeeklySnapshot
+        MetaSnapWeeklyDay        = $MetaSnapWeeklyDay
+        MetaSnapWeeklyTime       = $MetaSnapWeeklyTime
+        EnableMonthlySnapshot    = $EnableMonthlySnapshot
+        MetaSnapMonthlyWeekday   = $MetaSnapMonthlyWeekday
+        MetaSnapMonthlyTime      = $MetaSnapMonthlyTime
+        MetaForceSnapMonthly     = $MetaForceSnapMonthly
+        DeploymentDate           = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    }
+
+    $config | ConvertTo-Json -Depth 10 | Out-File -FilePath $Script:ConfigFile -Encoding UTF8
+    Write-Log "Configuration saved to: $Script:ConfigFile"
+}
+
+#-------------------------------------------------------------------------------------------------
+# Validate connectivity to Azure Storage resources
+#-------------------------------------------------------------------------------------------------
+function Test-StorageConnectivity {
+    <#
+    .SYNOPSIS
+        Validates that the required Azure Storage containers and tables exist and are reachable.
+    #>
+
+    param (
+        [Parameter(Mandatory)]
+        $Context   # Removed strong typing (PS7 safe)
+    )
+
+    Write-Log 'Validating storage account connectivity...'
+
+    # Validate Containers
+    foreach ($name in @($ContainerName, $SnapshotsContainerName)) {
+        try {
+            $c = Get-AzStorageContainer -Name $name -Context $Context -ErrorAction Stop
+            Write-Log "Container '$name' : OK"
+        }
+        catch {
+            Write-Log "Container '$name' not found (may be created by another process)." -Level WARN
+        }
+    }
+
+    # Validate Tables
+    foreach ($name in @($TableName, $ProcessTableName, $CaevesConfigTableName)) {
+        try {
+            $t = Get-AzStorageTable -Name $name -Context $Context -ErrorAction Stop
+            Write-Log "Table '$name' : OK"
+        }
+        catch {
+            Write-Log "Table '$name' not found (may be created by another process)." -Level WARN
+        }
+    }
+    Write-Log "Storage connectivity validation complete."
+}
+
+#-------------------------------------------------------------------------------------------------
+# Install CAEVES software
+#-------------------------------------------------------------------------------------------------
+function Install-CaevesSoftware {
+    <#
+    .SYNOPSIS
+        Sets the deployment environment variable, downloads and silently installs the CAEVES MSI.
+    #>
+    Write-Log 'Installing CAEVES software...'
+    $isManifestUrlSet = $true
+    $EnvironmentName = $Script:EnvironmentName
+
+    switch ($EnvironmentName) {
+        'Development' {
+            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Skipping MSI installation in development environment."
+            $manifestUrl = " https://buildrepoprod.blob.core.windows.net/artifacts/CAEVES.FCG.App/main/manifest.json"
+        }
+        'Staging' {
+            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Proceeding with MSI installation with staging manifest."
+            $manifestUrl = "https://buildrepoprod.blob.core.windows.net/artifacts-stage/CAEVES.FCG.App/staging/manifest.json"
+        }        
+        'Production' {
+            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Proceeding with MSI installation."
+            $manifestUrl = "https://buildrepoprod.blob.core.windows.net/artifacts-prod/CAEVES.FCG.App/production/manifest.json"
+        }
+        Default {            
+            $isManifestUrlSet = $false
+            $EnvironmentName = 'Development'
+            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Downloading development build directly from blob storage." -Level WARN
+        }
+    }
+
+	[System.Environment]::SetEnvironmentVariable('DOTNET_ENVIRONMENT', $EnvironmentName, 'Machine')
+
+    if ($isManifestUrlSet) {        
+        $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing
+        $stream = $response.RawContentStream
+        $reader = New-Object System.IO.StreamReader($stream, $true)  # auto-detect encoding
+        $content = $reader.ReadToEnd()
+        $manifest = $content | ConvertFrom-Json
+        $msiUrl = $manifest.installer.url
+    }
+    else {
+        $msiUrl = "https://caeveswebassets.blob.core.windows.net/caevesbuildimage/build/CAEVES.FCG.App_Release.msi"
+    }
+
+    $file = Join-Path $Script:TempPath ([System.IO.Path]::GetFileName($msiUrl))
+    Write-Log "Downloading: $msiUrl"
+    Invoke-WebRequest -Uri $msiUrl -OutFile $file
+    Write-Log "Installing : $file"
+    Start-Process -FilePath $file -ArgumentList '/quiet' -Wait
+
+    [System.Environment]::SetEnvironmentVariable('CAEVESEnabled', 'True', 'Machine')
+    Write-Log 'CAEVES software installed and CAEVESEnabled environment variable set to True.'
+}
+
+#-------------------------------------------------------------------------------------------------
+# Configure CAEVES FCG Agent: Set registry keys, configure storage, and start services
+#-------------------------------------------------------------------------------------------------
+function Set-CaevesAgentConfiguration {
+    <#
+    .SYNOPSIS
+        Configures the CAEVES FCG Agent registry keys and starts the required services using Caeves module cmdlets.
+    #>
+    param ([string] $StorageConnectionString)
+
+    Write-Log 'Configuring CAEVES FCG Agent...'
+
+    if (-not (Get-Module -Name Caeves)) {
+        Import-Module -Name Caeves
+    }
+
+    # Storage configuration
+    $storageParams = @{
+        Name                     = $StorageAccountName
+        StorageAccountName       = $StorageAccountName
+        StorageType              = 'azureblob'
+        StorageConnectionString  = $StorageConnectionString
+        ContainerName            = $ContainerName
+        SnapshotsContainerName   = $SnapshotsContainerName
+        StorageAccountResourceId = $StorageAccountResourceId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TableName)) { $storageParams['MetadataTableName'] = $TableName }
+    if (-not [string]::IsNullOrWhiteSpace($ProcessTableName)) { $storageParams['MetadataProcessTableName'] = $ProcessTableName }
+    if (-not [string]::IsNullOrWhiteSpace($CaevesConfigTableName)) { $storageParams['CaevesConfigTableName'] = $CaevesConfigTableName }
+
+    Add-FCGStorageConfiguration @storageParams
+    Write-Log "[Add-FCGStorageConfiguration] Storage configuration for '$StorageAccountName' added successfully.`n`n"
+
+    # License
+    Set-FCGSaasSubscriptionId -SubscriptionId $SaasSubscriptionId
+    Write-Log "[Set-FCGSaasSubscriptionId] SaaSSubscriptionID set to: $SaasSubscriptionId `n`n"
+
+    # Migration mode
+    Set-FCGPurgeOnFlush -Value 1
+    Write-Log "[Set-FCGPurgeOnFlush] PurgeOnFlush set to 1.`n`n"
+
+    # Snapshot frequency
+    Set-FCGSnapshotFrequency -Value $MetaSnapFrequency
+    Write-Log "[Set-FCGSnapshotFrequency] Snapshot frequency set to: $MetaSnapFrequency `n`n"
+
+
+    # Cache folder and volume configuration
+    Set-FCGCacheFolderPath -Path $Script:CacheDirPath
+    Write-Log "[Set-FCGCacheFolderPath] Cache folder path set: $Script:CacheDirPath `n`n"
+
+    # Log Metadata volume info
+    $metaVolume = Get-CimInstance -ClassName Win32_Volume | Where-Object { $_.Label -eq 'Metadata' }
+    if ($metaVolume) {
+        Write-Log "Metadata volume : $($metaVolume.DriveLetter) | FS=$($metaVolume.FileSystem) | GUID=$($metaVolume.DeviceID)"
+    }
+    else {
+        Write-Log "Metadata volume (label=Metadata) not found via CIM." -Level WARN
+    }
+
+    Add-FCGVolumeConfiguration -MetadataVolume $Script:MetadataVolume -PrimaryEndpoint $StorageAccountName -SecondaryEndpoint $StorageAccountName
+    Write-Log "[Add-FCGVolumeConfiguration] Volume configuration for $Script:MetadataVolume added. Primary and secondary endpoints set to $StorageAccountName.`n`n"
+
+    # Start services
+	sc.exe config "fcgmf" start= system
+    Start-Service -Name 'fcgmf'
+	
+    Start-Service -Name 'FileCloudGatewayService'
+    Write-Log "Services started: fcgmf, FileCloudGatewayService"
+    Write-Log "CAEVES FCG Agent configured successfully."
+}
+
+#-------------------------------------------------------------------------------------------------
+# Configure VSS Shadow Storage: Set the MaxShadowCopies registry value and configure shadow storage for the Metadata volume
+#-------------------------------------------------------------------------------------------------
+function Set-VssMaxShadowCopies {
+    <#
+    .SYNOPSIS
+        Sets the MaxShadowCopies registry DWORD to 512 under VSS\Settings.
+    #>
+    param ([int] $MaxCount = 512)
+
+    Write-Log "Setting MaxShadowCopies = $MaxCount..."
+    $regPath = 'HKLM:\System\CurrentControlSet\Services\VSS\Settings'
+    if (-not (Test-Path $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
+    New-ItemProperty -Path $regPath -Name 'MaxShadowCopies' -Value $MaxCount -PropertyType DWord -Force | Out-Null
+    Write-Log "MaxShadowCopies set to $MaxCount."
+}
+
+#-------------------------------------------------------------------------------------------------
+# Create record in CAEVES Metrics & Billing Table 
+# ------------------------------------------------------------------------------------------------
+function Update-StorageCapacityAsync {
+    param(
+        [string]$Environment
+    )
+
+    # Construct JSON payload
+    $payload = @{
+        action             = "init"
+        marketplaceid      = $saasSubscriptionId
+        storageaccountname = $StorageAccountName
+    } | ConvertTo-Json -Depth 3
+    Write-Log "[UpdateStorageCapacityAsync] Constructed Payload: $payload" -Level DEBUG
+
+    # Construct endpoint URL
+    switch ($Environment) {
+        Development { $uri = "https://caevessaashelperfunc-dev.azurewebsites.net/api/UpsertCaevesCapacityMetrics?code=DK9f11RSFzokW-gATliApXTfciuejRMxX4FU7lUPw2JHAzFuoFd6GA==" }
+        Staging { $uri = "https://caeves-saashelper-stg.azurewebsites.net/api/UpsertCaevesCapacityMetrics?code=D_DZN0bKCy1Z0LtdbGoxBWW-2VfrhxQiZujJOXd3QW32AzFuiwv7zA==" }
+        Production { $uri = "https://caeves-saashelper.azurewebsites.net/api/UpsertCaevesCapacityMetrics?code=HRMdSWn7FlTxAtbqSf6V9a4HIXQdKBRDrE_j4vUr4zsdAzFuC2m_JA==" }
+    }    
+
+    # Send POST request
+    try {
+        Write-Log "[UpdateStorageCapacityAsync] Invoking Capacity metrics update endpoint."
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Body $payload -Headers @{"Content-Type" = "application/json" }
+        Write-Log "[UpdateStorageCapacityAsync] Update successful."
+    }
+    catch {
+        Write-Log "[UpdateStorageCapacityAsync] Request failed: $_" -Level ERROR
+    }
+}
+
+# ========================================================================================
+# Region: Error Handling
+# ========================================================================================
+function Write-DetailedError {
+    param([Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    Write-Log "========== ERROR START =========="  -Level ERROR
+    Write-Log "Message        : $($ErrorRecord.Exception.Message)" -Level ERROR
+    Write-Log "Type           : $($ErrorRecord.Exception.GetType().FullName)" -Level ERROR
+
+    if ($ErrorRecord.Exception.InnerException) {
+        Write-Log "Inner Exception: $($ErrorRecord.Exception.InnerException.Message)" -Level ERROR
+    }
+
+    Write-Log "Category       : $($ErrorRecord.CategoryInfo)" -Level ERROR
+    Write-Log "Target Object  : $($ErrorRecord.TargetObject)" -Level ERROR
+    Write-Log "FQID           : $($ErrorRecord.FullyQualifiedErrorId)" -Level ERROR
+    Write-Log "Line           : $($ErrorRecord.InvocationInfo.ScriptLineNumber)" -Level ERROR
+    Write-Log "Command        : $($ErrorRecord.InvocationInfo.MyCommand)" -Level ERROR
+    Write-Log "Position       : $($ErrorRecord.InvocationInfo.PositionMessage)" -Level ERROR
+    Write-Log "Stack Trace    : $($ErrorRecord.ScriptStackTrace)" -Level ERROR
+    Write-Log "========== ERROR END ==========" -Level ERROR
 }
 
 
-exit 0
+# ========================================================================================
+# Region: Entry Point
+# ========================================================================================
+function Invoke-CaevesProvisioning {
+    <#
+    .SYNOPSIS
+        Orchestrates the full CAEVES first-boot provisioning sequence.
+    #>
+
+    # --- Setup: directories and transcript ---
+    Initialize-CaevesDirectories
+    Start-Transcript -Path $Script:LogFile -Append
+
+    try {
+        Write-Log '===== CAEVES Provisioning Started ====='
+        Assert-Administrator
+
+        $storageConnectionString = "DefaultEndpointsProtocol=https;AccountName=$StorageAccountName;AccountKey=$StorageAccountKey;EndpointSuffix=core.windows.net"
+
+        # Step 1: Save configuration file
+        Save-CaevesConfiguration -StorageConnectionString $storageConnectionString
+
+        # Step 2: Validate storage connectivity
+        Import-Module Az.Storage -Force -ErrorAction Stop
+        $storageContext = New-AzStorageContext -StorageAccountName $StorageAccountName -StorageAccountKey $StorageAccountKey
+        Test-StorageConnectivity -Context $storageContext
+
+        # Step 3: First-boot gate
+        if (Test-Path $Script:BootMarker) {
+            Write-Log 'CAEVES already provisioned (boot.complete marker found). Skipping first-boot steps.'
+        }
+        else {
+            Write-Log 'Running CAEVES first-boot provisioning...'
+
+            # Step 3a: Partition data disks and set permissions on Metadata volume for the FCG Agent
+            Initialize-CaevesDataDisks
+            Set-PermissionsToMetadataVolume
+
+            # Step 3b: Wallpaper
+            Set-CaevesWallpaper
+
+            # Step 3c: Install software
+            Install-CaevesSoftware
+
+            # Step 3d: Mark first boot complete
+            New-Item -ItemType File -Path $Script:BootMarker -Force | Out-Null
+            Write-Log 'First-boot provisioning complete. Marker written.'
+        }
+
+
+        # Step 4: Configure CAEVES FCG Agent (runs on every extension execution)
+        if (Test-Path $Script:ConfigFile) {
+
+            Set-CaevesAgentConfiguration -StorageConnectionString $storageConnectionString
+        }
+        else {
+            Write-Log "Config file not found at '$Script:ConfigFile'. Skipping agent configuration." -Level WARN
+        }
+
+        # Step 5: VSS registry tuning
+        Set-VssMaxShadowCopies -MaxCount $Script:MaxSnapshotCount
+
+        # Step 6: Metrics & billing
+        Update-StorageCapacityAsync -Environment $Script:EnvironmentName
+
+        # Step 7: VSS shadow storage routing
+        Initialize-VssShadowStorage -MetadataVolume "F:" -SnapshotsLabel "Snapshots" -MaxSize "UNBOUNDED"
+
+        # Step 8: Initialize snapshot schedule tasks based on configuration (if retention is configured)
+        Initialize-SnapshotTasks
+
+        Write-Log '========== CAEVES Provisioning Completed Successfully =========='
+    }
+    catch {
+        Write-DetailedError -ErrorRecord $_
+        exit 1
+    }
+    finally {
+        Stop-Transcript
+    }
+}
+
+# ===================================================================
+# Script entry point
+# ===================================================================
+Invoke-CaevesProvisioning
