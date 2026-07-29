@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 #Requires -Modules Az.Storage
 # ============================================================================================================================
-# CAEVES-VMExtension-dev.ps1
+# CAEVES-VMExtension-Staging.ps1
 # CAEVES Configuration Script for Azure Deployment
 # This script is hosted in a storage account and invoked by the Azure CustomScriptExtension.
 #
@@ -59,8 +59,6 @@ $Script:ConfigFile = 'C:\CAEVES\Config\FCGConfig.json'
 $Script:LogFile = $Script:LogPath + '\Azure-Deployment.log'
 $Script:BootMarker = 'C:\CAEVES\boot.complete'
 $Script:TempPath = 'C:\Temp'
-$Script:WallpaperDir = 'C:\Windows\OEM'
-$Script:WallpaperPath = 'C:\Windows\OEM\CAEVES-wallpaper.jpg'
 $Script:CacheDirPath = 'G:\Cache'
 $Script:MaxSnapshotCount = 500
 $Script:MetadataVolume = 'F:\'
@@ -228,68 +226,6 @@ function ConvertTo-EncryptedString {
     $result = [Convert]::ToBase64String($ms.ToArray())
     $ms.Close()
     return $result
-}
-
-# =========================================================================================
-# Region: Wallpaper
-# =========================================================================================
-function Set-CaevesWallpaper {
-    <#
-    .SYNOPSIS
-        Downloads the CAEVES wallpaper and applies it to all existing user profiles and the current session.
-    #>
-    Write-Log 'Applying CAEVES wallpaper...'
-
-    New-Item -Path $Script:WallpaperDir -ItemType Directory -Force | Out-Null
-    # Start-BitsTransfer is significantly faster than Invoke-WebRequest for large file downloads
-    Start-BitsTransfer -Source 'https://caeveswebassets.blob.core.windows.net/caevesbuildimage/CAEVES-Windows-BG-2025.jpg' `
-        -Destination $Script:WallpaperPath
-
-    # Apply to all existing user registry hives
-    $usersRoot = 'Registry::HKEY_USERS'
-    $wallpaperStyle = '0'   # 0 = Centered
-    Get-ChildItem -Path $usersRoot | ForEach-Object {
-        $sid = $_.PSChildName
-        if ($sid -match '^S-1-5-21-\d+-\d+-\d+-\d+$') {
-            $desktopKey = "$usersRoot\$sid\Control Panel\Desktop"
-            try {
-                if (Test-Path -Path $desktopKey) {
-                    Set-ItemProperty -Path $desktopKey -Name 'Wallpaper'      -Value $Script:WallpaperPath
-                    Set-ItemProperty -Path $desktopKey -Name 'WallpaperStyle' -Value $wallpaperStyle
-                    Write-Log "Wallpaper updated for SID: $sid"
-                }
-                else {
-                    Write-Log "Desktop registry key not found for SID: $sid" -Level WARN
-                }
-            }
-            catch {
-                Write-Log "Failed to update wallpaper for SID $sid : $_" -Level WARN
-            }
-        }
-    }
-
-    # Apply immediately to the current session via Win32 API
-    # Guard Add-Type: compiling C# on every run adds ~1-2s; skip if already loaded in this session
-    if (-not ([System.Management.Automation.PSTypeName]'NativeMethods').Type) {
-        Add-Type @'
-using System.Runtime.InteropServices;
-public class NativeMethods {
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-}
-'@
-    }
-    $SPI_SETDESKWALLPAPER = 0x0014
-    $result = [NativeMethods]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $Script:WallpaperPath, 0x01 -bor 0x02)
-    if ($result) { Write-Log 'Wallpaper applied to current session.' }
-    else { Write-Log 'Wallpaper update failed for current session (non-interactive).' -Level WARN }
-
-    # Update CAEVES Configuration desktop shortcut
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
-    $shortcut.WorkingDirectory = 'C:\Program Files\Caeves\FCGUI'
-    $shortcut.Save()
-    Write-Log 'Desktop shortcut updated.'
 }
 
 # ---------------------- HELPER FUNCTIONS -----------------------------------------
@@ -909,13 +845,10 @@ function Invoke-CaevesProvisioning {
             Initialize-CaevesDataDisks
             Set-PermissionsToMetadataVolume
 
-            # Step 3b: Wallpaper
-            Set-CaevesWallpaper
-
-            # Step 3c: Install software
+            # Step 3b: Install software
             Install-CaevesSoftware
 
-            # Step 3d: Mark first boot complete
+            # Step 3c: Mark first boot complete
             New-Item -ItemType File -Path $Script:BootMarker -Force | Out-Null
             Write-Log 'First-boot provisioning complete. Marker written.'
         }
