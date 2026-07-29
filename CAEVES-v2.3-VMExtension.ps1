@@ -784,7 +784,9 @@ function Set-CaevesAgentConfiguration {
     Write-Log "[Add-FCGVolumeConfiguration] Volume configuration for $Script:MetadataVolume added. Primary and secondary endpoints set to $StorageAccountName.`n`n"
 
     # Start services
+    sc.exe config "fcgmf" start= system
     Start-Service -Name 'fcgmf'
+    
     Start-Service -Name 'FileCloudGatewayService'
     Write-Log "Services started: fcgmf, FileCloudGatewayService"
     Write-Log "CAEVES FCG Agent configured successfully."
