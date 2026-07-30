@@ -628,12 +628,9 @@ function Install-CaevesSoftware {
         }
         Default {            
             $isManifestUrlSet = $false
-            $EnvironmentName = 'Development'
-            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Downloading development build directly from blob storage." -Level WARN
+            Write-Log "Unrecognized DOTNET_ENVIRONMENT '$EnvironmentName'. No manifest URL configured for this environment." -Level ERROR
         }
     }
-
-    [System.Environment]::SetEnvironmentVariable('DOTNET_ENVIRONMENT', $EnvironmentName, 'Machine')
 
     if ($isManifestUrlSet) {        
         $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing
@@ -644,17 +641,29 @@ function Install-CaevesSoftware {
         $msiUrl = $manifest.installer.url
     }
     else {
-        $msiUrl = "https://caeveswebassets.blob.core.windows.net/caevesbuildimage/build/CAEVES.FCG.App_Release_dev-46.msi"
+        throw "Unrecognized DOTNET_ENVIRONMENT '$EnvironmentName' - no manifest URL configured. Update the environment switch in Install-CaevesSoftware to add support for this environment."
     }
 
+    # Set the DOTNET_ENVIRONMENT environment variable for the machine
+    [System.Environment]::SetEnvironmentVariable('DOTNET_ENVIRONMENT', $EnvironmentName, 'Machine')
+
+    # Download and install the CAEVES MSI
     $file = Join-Path $Script:TempPath ([System.IO.Path]::GetFileName($msiUrl))
     Write-Log "Downloading: $msiUrl"
     Invoke-WebRequest -Uri $msiUrl -OutFile $file
     Write-Log "Installing : $file"
     Start-Process -FilePath $file -ArgumentList '/quiet' -Wait
 
+    # Set the CAEVESEnabled environment variable to True
     [System.Environment]::SetEnvironmentVariable('CAEVESEnabled', 'True', 'Machine')
     Write-Log 'CAEVES software installed and CAEVESEnabled environment variable set to True.'
+
+    # Update CAEVES Configuration desktop shortcut
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
+    $shortcut.WorkingDirectory = 'C:\Program Files\Caeves\FCGUI'
+    $shortcut.Save()
+    Write-Log 'Desktop shortcut updated.'
 }
 
 #-------------------------------------------------------------------------------------------------
