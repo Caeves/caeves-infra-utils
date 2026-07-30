@@ -59,8 +59,6 @@ $Script:ConfigFile = 'C:\CAEVES\Config\FCGConfig.json'
 $Script:LogFile = $Script:LogPath + '\Azure-Deployment.log'
 $Script:BootMarker = 'C:\CAEVES\boot.complete'
 $Script:TempPath = 'C:\Temp'
-$Script:WallpaperDir = 'C:\Windows\OEM'
-$Script:WallpaperPath = 'C:\Windows\OEM\CAEVES-wallpaper.jpg'
 $Script:CacheDirPath = 'G:\Cache'
 $Script:MaxSnapshotCount = 500
 $Script:MetadataVolume = 'F:\'
@@ -228,68 +226,6 @@ function ConvertTo-EncryptedString {
     $result = [Convert]::ToBase64String($ms.ToArray())
     $ms.Close()
     return $result
-}
-
-# =========================================================================================
-# Region: Wallpaper
-# =========================================================================================
-function Set-CaevesWallpaper {
-    <#
-    .SYNOPSIS
-        Downloads the CAEVES wallpaper and applies it to all existing user profiles and the current session.
-    #>
-    Write-Log 'Applying CAEVES wallpaper...'
-
-    New-Item -Path $Script:WallpaperDir -ItemType Directory -Force | Out-Null
-    # Start-BitsTransfer is significantly faster than Invoke-WebRequest for large file downloads
-    Start-BitsTransfer -Source 'https://caeveswebassets.blob.core.windows.net/caevesbuildimage/CAEVES-Windows-BG-2025.jpg' `
-        -Destination $Script:WallpaperPath
-
-    # Apply to all existing user registry hives
-    $usersRoot = 'Registry::HKEY_USERS'
-    $wallpaperStyle = '0'   # 0 = Centered
-    Get-ChildItem -Path $usersRoot | ForEach-Object {
-        $sid = $_.PSChildName
-        if ($sid -match '^S-1-5-21-\d+-\d+-\d+-\d+$') {
-            $desktopKey = "$usersRoot\$sid\Control Panel\Desktop"
-            try {
-                if (Test-Path -Path $desktopKey) {
-                    Set-ItemProperty -Path $desktopKey -Name 'Wallpaper'      -Value $Script:WallpaperPath
-                    Set-ItemProperty -Path $desktopKey -Name 'WallpaperStyle' -Value $wallpaperStyle
-                    Write-Log "Wallpaper updated for SID: $sid"
-                }
-                else {
-                    Write-Log "Desktop registry key not found for SID: $sid" -Level WARN
-                }
-            }
-            catch {
-                Write-Log "Failed to update wallpaper for SID $sid : $_" -Level WARN
-            }
-        }
-    }
-
-    # Apply immediately to the current session via Win32 API
-    # Guard Add-Type: compiling C# on every run adds ~1-2s; skip if already loaded in this session
-    if (-not ([System.Management.Automation.PSTypeName]'NativeMethods').Type) {
-        Add-Type @'
-using System.Runtime.InteropServices;
-public class NativeMethods {
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-}
-'@
-    }
-    $SPI_SETDESKWALLPAPER = 0x0014
-    $result = [NativeMethods]::SystemParametersInfo($SPI_SETDESKWALLPAPER, 0, $Script:WallpaperPath, 0x01 -bor 0x02)
-    if ($result) { Write-Log 'Wallpaper applied to current session.' }
-    else { Write-Log 'Wallpaper update failed for current session (non-interactive).' -Level WARN }
-
-    # Update CAEVES Configuration desktop shortcut
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
-    $shortcut.WorkingDirectory = 'C:\Program Files\Caeves\FCGUI'
-    $shortcut.Save()
-    Write-Log 'Desktop shortcut updated.'
 }
 
 # ---------------------- HELPER FUNCTIONS -----------------------------------------
@@ -690,14 +626,11 @@ function Install-CaevesSoftware {
             Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Proceeding with MSI installation."
             $manifestUrl = "https://buildrepoprod.blob.core.windows.net/artifacts-prod/CAEVES.FCG.App/production/manifest.json"
         }
-        Default {            
+        Default {
             $isManifestUrlSet = $false
-            $EnvironmentName = 'Development'
-            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Downloading development build directly from blob storage." -Level WARN
+            Write-Log "Unrecognized DOTNET_ENVIRONMENT '$EnvironmentName'. No manifest URL configured for this environment." -Level ERROR
         }
-    }
-
-	[System.Environment]::SetEnvironmentVariable('DOTNET_ENVIRONMENT', $EnvironmentName, 'Machine')
+    }    
 
     if ($isManifestUrlSet) {        
         $response = Invoke-WebRequest -Uri $manifestUrl -UseBasicParsing
@@ -708,17 +641,29 @@ function Install-CaevesSoftware {
         $msiUrl = $manifest.installer.url
     }
     else {
-        $msiUrl = "https://caeveswebassets.blob.core.windows.net/caevesbuildimage/build/CAEVES.FCG.App_Release.msi"
+        throw "Unrecognized DOTNET_ENVIRONMENT '$EnvironmentName' - no manifest URL configured. Update the environment switch in Install-CaevesSoftware to add support for this environment."
     }
 
+    # Set the DOTNET_ENVIRONMENT environment variable for the machine
+    [System.Environment]::SetEnvironmentVariable('DOTNET_ENVIRONMENT', $EnvironmentName, 'Machine')
+
+    # Download and install the CAEVES MSI
     $file = Join-Path $Script:TempPath ([System.IO.Path]::GetFileName($msiUrl))
     Write-Log "Downloading: $msiUrl"
     Invoke-WebRequest -Uri $msiUrl -OutFile $file
     Write-Log "Installing : $file"
     Start-Process -FilePath $file -ArgumentList '/quiet' -Wait
 
+    # Set the CAEVESEnabled environment variable to True
     [System.Environment]::SetEnvironmentVariable('CAEVESEnabled', 'True', 'Machine')
     Write-Log 'CAEVES software installed and CAEVESEnabled environment variable set to True.'
+
+    # Update CAEVES Configuration desktop shortcut
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut("$env:PUBLIC\Desktop\CAEVES Configuration.lnk")
+    $shortcut.WorkingDirectory = 'C:\Program Files\Caeves\FCGUI'
+    $shortcut.Save()
+    Write-Log 'Desktop shortcut updated.'
 }
 
 #-------------------------------------------------------------------------------------------------
@@ -909,13 +854,10 @@ function Invoke-CaevesProvisioning {
             Initialize-CaevesDataDisks
             Set-PermissionsToMetadataVolume
 
-            # Step 3b: Wallpaper
-            Set-CaevesWallpaper
-
-            # Step 3c: Install software
+            # Step 3b: Install software
             Install-CaevesSoftware
 
-            # Step 3d: Mark first boot complete
+            # Step 3c: Mark first boot complete
             New-Item -ItemType File -Path $Script:BootMarker -Force | Out-Null
             Write-Log 'First-boot provisioning complete. Marker written.'
         }
