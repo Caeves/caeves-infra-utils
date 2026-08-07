@@ -10,10 +10,10 @@ Before deploying the CAEVES Hybrid Environment from Azure Marketplace, you must 
 ## Steps
 
 1. Open [Azure Cloud Shell](https://shell.azure.com) and select **Bash**.
-2. Review the script before running it, since it runs with Application Administrator privileges: [github.com/Caeves/caeves-infra-utils/blob/24e37036049d5f078c0df52736aac1766591b54d/Register-CaevesHybridApp.sh](https://github.com/Caeves/caeves-infra-utils/blob/24e37036049d5f078c0df52736aac1766591b54d/Register-CaevesHybridApp.sh)
-3. Download and run the pinned version of the script (not `main`, so what you reviewed is exactly what you run):
+2. Review the script before running it, since it runs with Application Administrator privileges: [github.com/Caeves/caeves-infra-utils/blob/release/v1.0/hybrid-environment/customer-scripts/Register-CaevesHybridApp.sh](https://github.com/Caeves/caeves-infra-utils/blob/release/v1.0/hybrid-environment/customer-scripts/Register-CaevesHybridApp.sh)
+3. Download and run the release/v1.0 version of the script (a permanent, versioned branch, so what you reviewed is exactly what you run):
    ```bash
-   curl -O https://raw.githubusercontent.com/Caeves/caeves-infra-utils/24e37036049d5f078c0df52736aac1766591b54d/Register-CaevesHybridApp.sh
+   curl -O https://raw.githubusercontent.com/Caeves/caeves-infra-utils/release/v1.0/hybrid-environment/customer-scripts/Register-CaevesHybridApp.sh
    bash Register-CaevesHybridApp.sh
    ```
    Optionally pass a custom display name for the app registration:
