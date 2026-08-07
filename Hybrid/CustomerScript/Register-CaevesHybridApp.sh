@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-APP_DISPLAY_NAME="${1:-CAEVES-Hybrid-Envt-App}"
+APP_DISPLAY_NAME="${1:-CAEVES-Hybrid-Environment}"
 
 echo "Checking Azure CLI login..."
 TENANT_ID="$(az account show --query tenantId -o tsv)"
