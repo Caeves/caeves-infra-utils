@@ -37,14 +37,14 @@ $ErrorActionPreference = 'Stop'
 # =============================================
 # SCRIPT-SCOPED CONSTANTS (CAEVES configuration)
 # =============================================
-# The environment name is used to select the appropriate CAEVES installer manifest and set the DOTNET_ENVIRONMENT variable.
-$Script:EnvironmentName = 'Development'
+$Script:EnvironmentName = $null   # resolved from ConfigParameters.json by Resolve-CaevesEnvironment
 
 $Script:CaevesRoot = 'C:\CAEVES'
 $Script:LogPath = 'C:\CAEVES\Logs'
 $Script:ConfigFile = 'C:\CAEVES\ConfigParameters.json'
 $Script:LogFile = $Script:LogPath + '\OnPrem-Deployment.log'
 $Script:BootMarker = 'C:\CAEVES\boot.complete'
+$Script:DiskLayoutFile = 'C:\CAEVES\disk-layout.json'
 $Script:TempPath = 'C:\Temp'
 $Script:CacheDirPath = 'G:\Cache'
 $Script:MaxSnapshotCount = 500
@@ -149,6 +149,12 @@ function Replace-DefaultWallpaper {
     $Wallpaper4KFolder = "C:\Windows\Web\4K\Wallpaper\Windows"
     $MainWallpaperFile = Join-Path $WallpaperMainFolder "img0.jpg"
 
+    # Check the replacement before deleting anything: without it the defaults would be removed and nothing put back.
+    if (-not (Test-Path $CustomWallpaper -PathType Leaf)) {
+        Write-Log "Custom wallpaper not found at $CustomWallpaper. Keeping the default Windows wallpapers." -Level WARN
+        return
+    }
+
     # --- MAIN WALLPAPER FOLDER ---
     Write-Log "=== Processing main wallpaper folder ==="
     Grant-AdminAccess -TargetPath $WallpaperMainFolder
@@ -158,26 +164,24 @@ function Replace-DefaultWallpaper {
         Remove-Item $_.FullName -Force
     }
 
-    if (Test-Path $CustomWallpaper) {
-        Copy-Item $CustomWallpaper $MainWallpaperFile -Force
-        Write-Log "Copied custom wallpaper to $MainWallpaperFile"
-    }
-    else {
-        Write-Warning "Custom wallpaper not found at $CustomWallpaper"
-    }
+    Copy-Item $CustomWallpaper $MainWallpaperFile -Force
+    Write-Log "Copied custom wallpaper to $MainWallpaperFile"
 
     # --- 4K WALLPAPER FOLDER ---
-    Write-Log "=== Processing 4K wallpaper folder ==="
-    Grant-AdminAccess -TargetPath $Wallpaper4KFolder
+    if (Test-Path $Wallpaper4KFolder) {
+        Write-Log "=== Processing 4K wallpaper folder ==="
+        Grant-AdminAccess -TargetPath $Wallpaper4KFolder
 
-    Get-ChildItem $Wallpaper4KFolder -File | ForEach-Object {
-        Write-Log "Deleting file: $($_.Name)"
-        Remove-Item $_.FullName -Force
-    }
+        Get-ChildItem $Wallpaper4KFolder -File | ForEach-Object {
+            Write-Log "Deleting file: $($_.Name)"
+            Remove-Item $_.FullName -Force
+        }
 
-    if (Test-Path $CustomWallpaper) {
         Copy-Item $CustomWallpaper $Wallpaper4KFolder -Force
         Write-Log "Copied custom wallpaper into 4K wallpaper folder"
+    }
+    else {
+        Write-Log "4K wallpaper folder not found at $Wallpaper4KFolder. Skipping." -Level WARN
     }
 
     Write-Log "Wallpaper replacement completed successfully!"
@@ -224,7 +228,7 @@ function Install-CaevesSoftware {
 
     switch ($EnvironmentName) {
         'Development' {
-            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Skipping MSI installation in development environment."
+            Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Proceeding with MSI installation in development environment."
             $manifestUrl = " https://buildrepoprod.blob.core.windows.net/artifacts/CAEVES.FCG.App/branch/manifest.json"
         }
         'Staging' {
@@ -267,35 +271,6 @@ function Install-CaevesSoftware {
     [System.Environment]::SetEnvironmentVariable('CAEVESEnabled', 'True', 'Machine')
     Write-Log 'CAEVES software installed and CAEVESEnabled environment variable set to True.'
 }
-
-function Install-CAEVESInstance {
-    Write-Log "Installing CAEVES Instance Software"
-
-    $msiUrl = "https://buildrepoprod.blob.core.windows.net/artifacts-prod/CAEVES.FCG.App/production/2.4/2.4.37.16381/CAEVES.FCG.App_Release_2.4.37.16381_2026-06-10_09-58.msi"
-    $msiFile = "C:\Temp\CAEVES.FCG.App.msi"
-
-    Write-Log "  Downloading CAEVES Instance MSI..."
-    Invoke-WebRequest -Uri $msiUrl -OutFile $msiFile
-
-    if (Test-Path $msiFile) {
-        Write-Log "  Installing CAEVES Instance (silent)..."
-        $msiArgs = "/i `"$msiFile`" /quiet /norestart /log `"C:\Temp\CAEVES-Install.log`""
-        $installer = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -NoNewWindow -PassThru
-
-        # Verify installation succeeded (0 = success, 3010 = success, reboot required)
-        if ($installer.ExitCode -in 0, 3010) {
-            Write-Log "  CAEVES Instance installed successfully"
-        }
-        else {
-            throw "CAEVES Instance installer failed with exit code $($installer.ExitCode). Check the install log at C:\Temp\CAEVES-Install.log"
-        }
-    }
-    else {
-        Write-Warning "  CAEVES Instance MSI download failed - file not found at $msiFile"
-    }
-}
-
-
 
 function Create-DesktopShortcuts {
     Write-Log "Creating Desktop Shortcuts"
@@ -455,6 +430,18 @@ function Initialize-ConfigFile {
     throw "ConfigParameters.json not found. Download it from your storage account into the same folder as this script (or to $($Script:ConfigFile)) and run the script again."
 }
 
+function Resolve-CaevesEnvironment {
+    $params = Get-Content $Script:ConfigFile -Raw | ConvertFrom-Json
+    $value = Get-ConfigProperty -Object $params -Name 'environment'
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "'environment' is missing in $($Script:ConfigFile). Expected Development, Staging or Production."
+    }
+    try { $Script:EnvironmentName = ([EnvironmentType]$value.Trim()).ToString() }
+    catch { throw "Invalid environment '$value' in $($Script:ConfigFile). Expected Development, Staging or Production." }
+    Write-Log "Environment resolved from config: $($Script:EnvironmentName)"
+}
+
+
 # =============================================
 # FUNCTION DEFINITIONS - CAEVES configuration
 # (from the earlier Setup-HybridConfiguration.ps1 v1.1 - Archana Patil)
@@ -483,76 +470,194 @@ function Write-Log {
     }
 }
 
-function Initialize-CaevesDataDisks {
-    Write-Log 'Initializing data disks with custom partitioning...'
+function Select-CaevesDataDisks {
+    <#
+    .SYNOPSIS
+        Picks the fixed and slider disks. Exactly two RAW (never-initialized) disks must be present,
+        so the script never has to guess which of the customer's disks it may format.
+    #>
+    $rawDisks = @(Get-Disk |
+        Where-Object { -not $_.IsBoot -and -not $_.IsSystem -and $_.PartitionStyle -eq 'RAW' } |
+        Sort-Object -Property Number)
 
-    # Safe to re-run: if the volumes from a previous run exist, there is nothing to initialize.
-    $existingMetadata = Get-CimInstance -ClassName Win32_Volume -Filter "Label='Metadata'"
-    $existingCache = Get-CimInstance -ClassName Win32_Volume -Filter "Label='Cache'"
-    if ($existingMetadata -and $existingCache) {
-        Write-Log 'Metadata and Cache volumes already exist. Skipping disk initialization.'
-        return
+    foreach ($d in $rawDisks) {
+        Write-Log "RAW disk found: Disk $($d.Number) | $([math]::Round($d.Size / 1GB, 1))GB | $($d.FriendlyName) | Serial='$($d.SerialNumber)' | Location='$($d.Location)'"
     }
 
-    # Get-Disk directly via IsBoot is faster than traversing Get-Partition | Get-Disk
-    $allDisks = Get-Disk
-    $osDisk = $allDisks | Where-Object { $_.IsBoot -eq $true }
-    $dataDisks = $allDisks | Where-Object { $_.Number -ne $osDisk.Number -and $_.PartitionStyle -eq 'RAW' }
-
-    if ($dataDisks.Count -lt 2) {
-        Write-Log "Expected 2 uninitialized data disks. Found $($dataDisks.Count). Skipping initialization." -Level WARN
-        exit 1
+    if ($rawDisks.Count -ne 2) {
+        throw "Expected exactly 2 uninitialized (RAW) data disks, found $($rawDisks.Count). CAEVES needs one empty disk for Snapshots/Metadata and one for Cache. Attach exactly two empty disks, make sure any other data disks are initialized, then run the script again."
     }
 
-    # Log disk locations for diagnostics
-    $dataDisks | ForEach-Object { Write-Log "Disk $($_.Number) Location: '$($_.Location)'" }
-
-    # Identify disks by LUN (works on WS2022 with SCSI controller: "...LUN 0", "...LUN 1")
-    $fixedDisk = $dataDisks | Where-Object { $_.Location -match "LUN\s*0\b" }
-    $sliderDisk = $dataDisks | Where-Object { $_.Location -match "LUN\s*1\b" }
-
-    # Fallback for WS2025 Azure Edition (NVMe controller reports a different Location format)
-    # Azure guarantees data disks are enumerated in LUN-attachment order, so sort by disk number.
-    if (-not $fixedDisk -or -not $sliderDisk) {
-        Write-Log "LUN-based disk identification failed (Location format may differ on this OS). Falling back to disk-number ordering." -Level WARN
-        $sortedDisks = $dataDisks | Sort-Object -Property Number
-        $fixedDisk = $sortedDisks[0]   # lowest disk number = LUN 0
-        $sliderDisk = $sortedDisks[1]   # next disk number  = LUN 1
+    # Identify disks by LUN (works with SCSI controllers: "...LUN 0", "...LUN 1").
+    $lun0 = @($rawDisks | Where-Object { $_.Location -match 'LUN\s*0\b' })
+    $lun1 = @($rawDisks | Where-Object { $_.Location -match 'LUN\s*1\b' })
+    if ($lun0.Count -eq 1 -and $lun1.Count -eq 1) {
+        return @{ Fixed = $lun0[0]; Slider = $lun1[0] }
     }
 
-    if (-not $fixedDisk -or -not $sliderDisk) {
-        Write-Log "Could not identify both fixed and slider disks correctly. Skipping initialization." -Level WARN
-        exit 1
+    # Hyper-V and many SAS controllers report every disk as LUN 0 on a different target, and NVMe reports no LUN.
+    Write-Log "LUN-based disk identification is ambiguous (LUN 0 matches: $($lun0.Count), LUN 1 matches: $($lun1.Count)). Falling back to disk-number order (lowest = fixed)." -Level WARN
+    return @{ Fixed = $rawDisks[0]; Slider = $rawDisks[1] }
+}
+
+function Get-CaevesRecordedDisk {
+    <#
+    .SYNOPSIS
+        Finds a disk recorded in the disk layout file, by UniqueId (stable across reboots) or by number as a fallback.
+    #>
+    param(
+        [string]$UniqueId,
+        [int]$Number,
+        [Parameter(Mandatory)][string]$Role
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($UniqueId)) {
+        $disk = @(Get-Disk | Where-Object { $_.UniqueId -eq $UniqueId })
+    }
+    else {
+        $disk = @(Get-Disk | Where-Object { $_.Number -eq $Number })
     }
 
-    # Initialize GPT
-    Initialize-Disk -Number $fixedDisk.Number  -PartitionStyle GPT -PassThru | Out-Null
-    Initialize-Disk -Number $sliderDisk.Number -PartitionStyle GPT -PassThru | Out-Null
+    if ($disk.Count -ne 1) {
+        throw "The $Role disk recorded in $($Script:DiskLayoutFile) (UniqueId='$UniqueId', Number=$Number) was not found. If the disks were replaced, clear any incomplete CAEVES disks, delete that file and run the script again."
+    }
+    if ($disk[0].IsBoot -or $disk[0].IsSystem) {
+        throw "The $Role disk recorded in $($Script:DiskLayoutFile) is now a boot/system disk (Disk $($disk[0].Number)). It will not be touched."
+    }
+    return $disk[0]
+}
 
-    # Refresh after initialization
-    $fixedDisk = Get-Disk -Number $fixedDisk.Number
-    $sliderDisk = Get-Disk -Number $sliderDisk.Number
+function Test-CaevesDiskComplete {
+    <#
+    .SYNOPSIS
+        Returns $true when every expected volume label is present on the given disk.
+    #>
+    param(
+        [Parameter(Mandatory)]$Disk,
+        [Parameter(Mandatory)][string[]]$Labels
+    )
 
-    Write-Log "Fixed  Disk (LUN 0): Disk $($fixedDisk.Number),  $([math]::Round($fixedDisk.Size / 1GB, 1))GB"
-    Write-Log "Slider Disk (LUN 1): Disk $($sliderDisk.Number), $([math]::Round($sliderDisk.Size / 1GB, 1))GB"
+    if ($Disk.PartitionStyle -eq 'RAW') { return $false }
 
-    # --- Fixed disk: 90% Snapshots (no letter) + 10% Metadata (F:) ---
-    $fixedSize = $fixedDisk.Size
+    $present = @(Get-Partition -DiskNumber $Disk.Number -ErrorAction SilentlyContinue |
+        Get-Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.FileSystemLabel -in $Labels } |
+        ForEach-Object { $_.FileSystemLabel } |
+        Select-Object -Unique)
+    return ($present.Count -eq $Labels.Count)
+}
+
+function Reset-CaevesDisk {
+    <#
+    .SYNOPSIS
+        Brings a selected disk to an empty GPT state. Only called for the two disks recorded in the layout file.
+    #>
+    param([Parameter(Mandatory)]$Disk)
+
+    if ($Disk.IsOffline) { Set-Disk -Number $Disk.Number -IsOffline $false }
+    if ($Disk.IsReadOnly) { Set-Disk -Number $Disk.Number -IsReadOnly $false }
+
+    if ($Disk.PartitionStyle -ne 'RAW') {
+        # The disk was RAW when it was selected, so anything on it was left by an earlier, incomplete run.
+        Write-Log "Disk $($Disk.Number) has an incomplete CAEVES layout from a previous run. Clearing it and partitioning again." -Level WARN
+        Clear-Disk -Number $Disk.Number -RemoveData -RemoveOEM -Confirm:$false
+    }
+
+    Initialize-Disk -Number $Disk.Number -PartitionStyle GPT | Out-Null
+    return Get-Disk -Number $Disk.Number
+}
+
+function New-CaevesFixedDiskLayout {
+    # Fixed disk: 90% Snapshots (no letter) + 10% Metadata (F:)
+    param([Parameter(Mandatory)]$Disk)
+
+    Write-Log "Fixed  Disk: Disk $($Disk.Number), $([math]::Round($Disk.Size / 1GB, 1))GB"
+
+    $fixedSize = $Disk.Size
     $snapshotSize = [math]::Floor($fixedSize * 0.90) - 1000000000   # leave 1 GB unallocated
     $metadataSize = [math]::Floor($fixedSize * 0.10)
 
-    $volSnapshot = New-Partition -DiskNumber $fixedDisk.Number -Size $snapshotSize
+    $volSnapshot = New-Partition -DiskNumber $Disk.Number -Size $snapshotSize
     Format-Volume -Partition $volSnapshot -FileSystem NTFS -NewFileSystemLabel 'Snapshots' -Confirm:$false | Out-Null
 
-    $volMetadata = New-Partition -DiskNumber $fixedDisk.Number -Size $metadataSize -DriveLetter F
+    $volMetadata = New-Partition -DiskNumber $Disk.Number -Size $metadataSize -DriveLetter F
     Format-Volume -Partition $volMetadata -FileSystem NTFS -NewFileSystemLabel 'Metadata'  -Confirm:$false | Out-Null
 
-    # --- Slider disk: Cache (G:) ---
-    $volCache = New-Partition -DiskNumber $sliderDisk.Number -UseMaximumSize -DriveLetter G
+    Write-Log "Fixed  disk partitioned: F: (Metadata $([math]::Round($metadataSize/1GB,1))GB), unlabelled (Snapshots $([math]::Round($snapshotSize/1GB,1))GB)"
+}
+
+function New-CaevesSliderDiskLayout {
+    # Slider disk: Cache (G:)
+    param([Parameter(Mandatory)]$Disk)
+
+    Write-Log "Slider Disk: Disk $($Disk.Number), $([math]::Round($Disk.Size / 1GB, 1))GB"
+
+    $volCache = New-Partition -DiskNumber $Disk.Number -UseMaximumSize -DriveLetter G
     Format-Volume -Partition $volCache -FileSystem NTFS -NewFileSystemLabel 'Cache' -Confirm:$false | Out-Null
 
-    Write-Log "Fixed  disk partitioned: F: (Metadata $([math]::Round($metadataSize/1GB,1))GB), unlabelled (Snapshots $([math]::Round($snapshotSize/1GB,1))GB)"
-    Write-Log "Slider disk partitioned: G: (Cache $([math]::Round($sliderDisk.Size/1GB,1))GB)"
+    Write-Log "Slider disk partitioned: G: (Cache $([math]::Round($Disk.Size/1GB,1))GB)"
+}
+
+function Initialize-CaevesDataDisks {
+    Write-Log 'Initializing data disks with custom partitioning...'
+
+    $fixedLabels = @('Snapshots', 'Metadata')
+    $sliderLabels = @('Cache')
+    $caevesLabels = $fixedLabels + $sliderLabels
+
+    if (Test-Path $Script:DiskLayoutFile) {
+        # A previous run already chose the disks: resume with exactly those two and nothing else.
+        $layout = Get-Content -Path $Script:DiskLayoutFile -Raw | ConvertFrom-Json
+        $fixedDisk = Get-CaevesRecordedDisk -UniqueId $layout.FixedUniqueId -Number $layout.FixedNumber -Role 'fixed'
+        $sliderDisk = Get-CaevesRecordedDisk -UniqueId $layout.SliderUniqueId -Number $layout.SliderNumber -Role 'slider'
+        Write-Log "Using the disks recorded in $($Script:DiskLayoutFile): fixed = Disk $($fixedDisk.Number), slider = Disk $($sliderDisk.Number)"
+    }
+    else {
+        # Hosts partitioned by an earlier version of this script have volumes but no layout file.
+        $existingLabels = @(Get-CimInstance -ClassName Win32_Volume |
+            Where-Object { $_.Label -in $caevesLabels } |
+            ForEach-Object { $_.Label } |
+            Select-Object -Unique)
+
+        if ($existingLabels.Count -eq $caevesLabels.Count) {
+            Write-Log 'Snapshots, Metadata and Cache volumes already exist. Skipping disk initialization.'
+            return
+        }
+        if ($existingLabels.Count -gt 0) {
+            throw "Found only some CAEVES volumes ($($existingLabels -join ', ')) and no $($Script:DiskLayoutFile) recording which disks they are on. Clear the incomplete CAEVES disks manually (Clear-Disk) and run the script again."
+        }
+
+        $selection = Select-CaevesDataDisks
+        $fixedDisk = $selection.Fixed
+        $sliderDisk = $selection.Slider
+
+        # Record the choice before touching any disk, so a re-run after a failure works on the same two disks.
+        [ordered]@{
+            FixedNumber    = $fixedDisk.Number
+            FixedUniqueId  = $fixedDisk.UniqueId
+            SliderNumber   = $sliderDisk.Number
+            SliderUniqueId = $sliderDisk.UniqueId
+            RecordedAt     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        } | ConvertTo-Json | Out-File -FilePath $Script:DiskLayoutFile -Encoding UTF8
+        Write-Log "Disk selection recorded in $($Script:DiskLayoutFile): fixed = Disk $($fixedDisk.Number), slider = Disk $($sliderDisk.Number)"
+    }
+
+    # Each disk is finished independently, so a failure on one disk does not force the other to be redone.
+    if (Test-CaevesDiskComplete -Disk $fixedDisk -Labels $fixedLabels) {
+        Write-Log "Fixed disk (Disk $($fixedDisk.Number)) already has its Snapshots and Metadata volumes. Skipping."
+    }
+    else {
+        $fixedDisk = Reset-CaevesDisk -Disk $fixedDisk
+        New-CaevesFixedDiskLayout -Disk $fixedDisk
+    }
+
+    if (Test-CaevesDiskComplete -Disk $sliderDisk -Labels $sliderLabels) {
+        Write-Log "Slider disk (Disk $($sliderDisk.Number)) already has its Cache volume. Skipping."
+    }
+    else {
+        $sliderDisk = Reset-CaevesDisk -Disk $sliderDisk
+        New-CaevesSliderDiskLayout -Disk $sliderDisk
+    }
 }
 
 # Note: The Metadata volume will be used for CAEVES configuration and must be accessible by the CAEVES service process, which runs under the Local Service account.
@@ -916,11 +1021,6 @@ function Import-CaevesConfiguration {
     $Script:MetaSnapMonthlyTime = Get-ConfigProperty -Object $params -Name 'metaSnapMonthlyTime'
     $Script:MetaForceSnapMonthly = ConvertTo-ScriptBool (Get-ConfigProperty -Object $params -Name 'metaForceSnapMonthly')
 
-    $environment = Get-ConfigProperty -Object $params -Name 'environment'
-    if (-not [string]::IsNullOrWhiteSpace($environment)) {
-        $Script:EnvironmentName = $environment
-    }
-
     $enableDaily = ConvertTo-ScriptBool (Get-ConfigProperty -Object $params -Name 'enableDailySnapshot')
     $enableWeekly = ConvertTo-ScriptBool (Get-ConfigProperty -Object $params -Name 'enableWeeklySnapshot')
     $enableMonthly = ConvertTo-ScriptBool (Get-ConfigProperty -Object $params -Name 'enableMonthlySnapshot')
@@ -1129,11 +1229,7 @@ function Invoke-CaevesProvisioning {
         Write-Log '===== CAEVES Hybrid Provisioning Started ====='
         Assert-Administrator
 
-        # Step 1: First-boot gate
-        if (Test-Path $Script:BootMarker) {
-            Write-Log 'CAEVES already provisioned (boot.complete marker found). Exiting.'
-            exit 4
-        }
+        # Step 1: First-boot gate is checked at the start of the main execution block, before Phase 1.
 
         Write-Log 'Running CAEVES first-boot provisioning...'
 
@@ -1184,56 +1280,79 @@ function Invoke-CaevesProvisioning {
 Initialize-CaevesDirectories
 Write-Log "===== CAEVES Hybrid Server Setup Started ====="
 
-# --- Inputs: gather everything up front so the long install below never stalls on a prompt ---
-Initialize-ConfigFile
+# Recorded in the error log so a failure shows which part of the setup it came from.
+$phase = 'Startup'
 
-if ($ConfigureOnly) {
-    # Resuming or relaunched in PowerShell 7: SPN details come from the environment, never the command line.
-    if (-not $TenantId) { $TenantId = $env:AZURE_TENANT_ID }
-    if (-not $ClientId) { $ClientId = $env:AZURE_CLIENT_ID }
-    if ($null -eq $ClientSecret -and $env:AZURE_CLIENT_SECRET) {
-        $ClientSecret = ConvertTo-SecureString $env:AZURE_CLIENT_SECRET -AsPlainText -Force
+try {
+    # --- First-boot gate: checked before anything else so a re-run on a provisioned host changes nothing ---
+    if (Test-Path $Script:BootMarker) {
+        Write-Log "CAEVES already provisioned (boot.complete marker found at $($Script:BootMarker)). Nothing to do. Exiting."
+        exit 4
     }
-}
 
-$TenantId = Read-SpnValue -Prompt 'Azure tenant ID (GUID)' -Current $TenantId -Guid
-$ClientId = Read-SpnValue -Prompt 'Service principal client (application) ID (GUID)' -Current $ClientId -Guid
-$ClientSecret = Read-SpnSecret -Current $ClientSecret
-Set-AzureServicePrincipalEnvironment -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+    # --- Inputs: gather everything up front so the long install below never stalls on a prompt ---
+    $phase = 'Inputs'
+    Initialize-ConfigFile
+    Resolve-CaevesEnvironment
 
-# --- Phase 1: Server prerequisites ---
-if (-not $ConfigureOnly) {
-    New-Item -Path "C:\WINDOWS\OEM" -ItemType Directory -Force | Out-Null
-
-    Harden-System
-    Remove-WirelessLANService
-    Configure-WallpaperAndUI
-    Replace-DefaultWallpaper
-    Install-Dependencies
-    Install-CAEVESInstance
-    Start-WindowsServerUpdate -Install
-    Create-DesktopShortcuts
-
-    Write-Log "Prerequisites and CAEVES software installation complete."
-}
-
-# --- Phase 2: CAEVES configuration (reads C:\CAEVES\ConfigParameters.json) ---
-Initialize-CaevesModulePath
-
-# The Caeves module needs PowerShell 7. PowerShell 7 is installed in Phase 1, so if this run started
-# in Windows PowerShell, continue the configuration in pwsh.
-if ($PSVersionTable.PSVersion.Major -lt 7) {
-    $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
-    if (-not (Test-Path $pwsh)) {
-        throw "PowerShell 7 was not found at $pwsh. Check that the PowerShell installer in Phase 1 completed."
+    if ($ConfigureOnly) {
+        # Resuming or relaunched in PowerShell 7: SPN details come from the environment, never the command line.
+        if (-not $TenantId) { $TenantId = $env:AZURE_TENANT_ID }
+        if (-not $ClientId) { $ClientId = $env:AZURE_CLIENT_ID }
+        if ($null -eq $ClientSecret -and $env:AZURE_CLIENT_SECRET) {
+            $ClientSecret = ConvertTo-SecureString $env:AZURE_CLIENT_SECRET -AsPlainText -Force
+        }
     }
-    Write-Log "Continuing the CAEVES configuration in PowerShell 7..."
-    & $pwsh -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ConfigureOnly
-    exit $LASTEXITCODE
-}
 
-if (-not (Get-Module -ListAvailable -Name Caeves)) {
-    throw "The Caeves PowerShell module was not found. Check that the CAEVES software installed correctly (C:\Temp\CAEVES-Install.log)."
-}
+    $TenantId = Read-SpnValue -Prompt 'Azure tenant ID (GUID)' -Current $TenantId -Guid
+    $ClientId = Read-SpnValue -Prompt 'Service principal client (application) ID (GUID)' -Current $ClientId -Guid
+    $ClientSecret = Read-SpnSecret -Current $ClientSecret
+    Set-AzureServicePrincipalEnvironment -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
 
-Invoke-CaevesProvisioning
+    # --- Phase 1: Server prerequisites ---
+    if (-not $ConfigureOnly) {
+        $phase = 'Phase 1 (server prerequisites)'
+        New-Item -Path "C:\WINDOWS\OEM" -ItemType Directory -Force | Out-Null
+
+        Harden-System
+        Remove-WirelessLANService
+        Configure-WallpaperAndUI
+        Replace-DefaultWallpaper
+        Install-Dependencies
+        Install-CaevesSoftware
+        Start-WindowsServerUpdate -Install
+        Create-DesktopShortcuts
+
+        Write-Log "Prerequisites and CAEVES software installation complete."
+    }
+
+    # --- Phase 2: CAEVES configuration (reads C:\CAEVES\ConfigParameters.json) ---
+    $phase = 'Phase 2 (CAEVES configuration)'
+    Initialize-CaevesModulePath
+
+    # The Caeves module needs PowerShell 7. PowerShell 7 is installed in Phase 1, so if this run started
+    # in Windows PowerShell, continue the configuration in pwsh.
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        if (-not (Test-Path $pwsh)) {
+            throw "PowerShell 7 was not found at $pwsh. Check that the PowerShell installer in Phase 1 completed."
+        }
+        Write-Log "Continuing the CAEVES configuration in PowerShell 7..."
+        & $pwsh -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -ConfigureOnly
+        exit $LASTEXITCODE
+    }
+
+    if (-not (Get-Module -ListAvailable -Name Caeves)) {
+        throw "The Caeves PowerShell module was not found. Check that the CAEVES software installed correctly (C:\Temp\CAEVES-Install.log)."
+    }
+
+    Invoke-CaevesProvisioning
+}
+catch {
+    Write-Log "CAEVES Hybrid Server Setup failed during: $phase" -Level ERROR
+    Write-DetailedError -ErrorRecord $_
+    if ($phase -like 'Phase 2*') {
+        Write-Log "Fix the problem and run this script again with -ConfigureOnly to skip the prerequisites." -Level ERROR
+    }
+    exit 1
+}
