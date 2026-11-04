@@ -13,6 +13,7 @@
 #                                                           Added WS2025 NVMe disk identification support
 #   2.0.4  - April 8, 2026     - Archana Patil          - Structured logging via Write-Log [YYYY-MM-DD HH:mm:ss] [LEVEL]
 #   2.7.0  - September 14, 2026 - Archana Patil         - Added QueueName parameter for Azure Storage queue configuration
+#   2.7.0  - November 4, 2026   - Archana Patil          - Snapshot schedules are only created for flags set to 'true'
 # ============================================================================================================================
 
 [CmdletBinding()]
@@ -455,7 +456,7 @@ function Initialize-SnapshotTasks {
     Write-Log "Configuring snapshot schedules based on provided parameters..."
 
     # Daily
-    if ($EnableDailySnapshot) {
+    if ($EnableDailySnapshot -eq 'true') {
         $schedules += @{
             Type = "Daily"
             Time = $MetaSnapDailyTime
@@ -464,7 +465,7 @@ function Initialize-SnapshotTasks {
     }
 
     # Weekly
-    if ($EnableWeeklySnapshot) {
+    if ($EnableWeeklySnapshot -eq 'true') {
         $schedules += @{
             Type    = "Weekly"
             WeekDay = $MetaSnapWeeklyDay
@@ -474,7 +475,7 @@ function Initialize-SnapshotTasks {
     }
 
     # Monthly
-    if ($EnableMonthlySnapshot) {
+    if ($EnableMonthlySnapshot -eq 'true') {
         # Parse value like "LastSunday", "FirstMonday", etc.
         if ($MetaSnapMonthlyWeekday -match '^(First|Second|Third|Fourth|Last)(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)$') {        
             $weekText = $matches[1]
@@ -501,6 +502,12 @@ function Initialize-SnapshotTasks {
         else {
             throw "Invalid Monthly Weekday format: $MetaSnapMonthlyWeekday"
         }
+    }
+
+    # New-FCGSnapshotScheduler requires at least one schedule entry
+    if ($schedules.Count -eq 0) {
+        Write-Log "No snapshot schedules enabled. Skipping snapshot scheduler creation."
+        return
     }
 
     New-FCGSnapshotScheduler -Name "FCGSnapshotPolicy" -Schedules $schedules
