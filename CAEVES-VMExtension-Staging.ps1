@@ -12,6 +12,7 @@
 #   2.0.3  - April 6, 2026     - Archana Patil          - Refactored into proper function-based architecture;
 #                                                           Added WS2025 NVMe disk identification support
 #   2.0.4  - April 8, 2026     - Archana Patil          - Structured logging via Write-Log [YYYY-MM-DD HH:mm:ss] [LEVEL]
+#   2.7.0  - October 21, 2026   - Archana Patil          - Added QueueName parameter for Azure Storage queue configuration
 # ============================================================================================================================
 
 [CmdletBinding()]
@@ -27,6 +28,7 @@ param (
     [Parameter(Mandatory)] [string] $TableName,
     [Parameter(Mandatory)] [string] $ProcessTableName,
     [Parameter(Mandatory)] [string] $CaevesConfigTableName,
+    [Parameter(Mandatory)] [string] $QueueName,
     [Parameter(Mandatory)] [string] $SaasOfferId,
     [Parameter(Mandatory)] [string] $SaasSubscriptionId,
     [Parameter(Mandatory)] [string] $AzureSubscriptionId,
@@ -541,6 +543,7 @@ function Save-CaevesConfiguration {
         TableName                = $TableName
         ProcessTableName         = $ProcessTableName
         CaevesConfigTableName    = $CaevesConfigTableName
+        QueueName                = $QueueName
         EnableDomainJoin         = $EnableDomainJoin
         AdFQDN                   = $AdFQDN
         OrganizationalUnit       = $OrganizationalUnit
@@ -695,6 +698,7 @@ function Set-CaevesAgentConfiguration {
     if (-not [string]::IsNullOrWhiteSpace($TableName)) { $storageParams['MetadataTableName'] = $TableName }
     if (-not [string]::IsNullOrWhiteSpace($ProcessTableName)) { $storageParams['MetadataProcessTableName'] = $ProcessTableName }
     if (-not [string]::IsNullOrWhiteSpace($CaevesConfigTableName)) { $storageParams['CaevesConfigTableName'] = $CaevesConfigTableName }
+    if (-not [string]::IsNullOrWhiteSpace($QueueName)) { $storageParams['QueueName'] = $QueueName }
 
     Add-FCGStorageConfiguration @storageParams
     Write-Log "[Add-FCGStorageConfiguration] Storage configuration for '$StorageAccountName' added successfully.`n`n"
