@@ -626,7 +626,7 @@ function Install-CaevesSoftware {
     switch ($EnvironmentName) {
         'Development' {
             Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Skipping MSI installation in development environment."
-            $manifestUrl = " https://buildrepoprod.blob.core.windows.net/artifacts/CAEVES.FCG.App/branch/manifest.json"
+            $manifestUrl = " https://buildrepoprod.blob.core.windows.net/artifacts/CAEVES.FCG.App/main/manifest.json"
         }
         'Staging' {
             Write-Log "DOTNET_ENVIRONMENT set to '$EnvironmentName'. Proceeding with MSI installation with staging manifest."
